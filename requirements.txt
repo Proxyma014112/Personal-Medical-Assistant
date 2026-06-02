@@ -1,0 +1,10 @@
+streamlit
+google-generativeai
+groq
+chromadb
+langchain
+langchain-groq
+langchain-community
+langchain-huggingface
+python-dotenv
+pillow
