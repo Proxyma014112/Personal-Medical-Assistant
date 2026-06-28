@@ -1,216 +1,110 @@
 import os
-#import cv2
-import re
-#import numpy as np
 import streamlit as st
-from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain.chains import create_retrieval_chain, create_history_aware_retriever
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from PIL import Image
-#import easyocr
-#import speech_recognition as sr
 import google.generativeai as genai
 
 
+# ─── Environment Setup ────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-# Gemini API কনফিগারেশন
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=gemini_api_key)
+groq_api_key  = os.environ.get("GROQ_API_KEY", "")
+gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
 
+if gemini_api_key:
+    genai.configure(api_key=gemini_api_key)
+
+
+# ─── Gemini Vision Functions ──────────────────────────────────────────
 def analyze_symptoms_from_image(image):
-    """
-    এই ফাংশনটি ছবি দেখে শুধুমাত্র বাহ্যিক লক্ষণ (Symptoms) বের করবে।
-    """
+    if not gemini_api_key:
+        return "ERROR: Gemini API key পাওয়া যায়নি।"
     try:
-        # Gemini 1.5 Flash মডেল কল করা
         model = genai.GenerativeModel('gemini-2.5-flash')
-        
-        # ⚠️ প্রম্পট ইঞ্জিনিয়ারিং: মডেলকে কড়া নির্দেশ দেওয়া হচ্ছে যেন সে ডাক্তারি না করে!
-        vision_prompt = """
-        You are an expert clinical observer. Look at this medical image (e.g., skin rash, wound, eye redness) 
-        and accurately describe the visible symptoms in 2-3 short sentences. 
-        DO NOT provide a diagnosis, disease name, or medical advice. 
-        Just describe what you see physically (color, shape, texture, location).
-        Reply in Bengali.
+        prompt = """
+        You are an expert clinical observer. Look at this medical image and accurately
+        describe the visible symptoms in 2-3 short sentences.
+        DO NOT provide a diagnosis or medical advice.
+        Just describe what you see physically. Reply in Bengali.
         """
-        
-        response = model.generate_content([vision_prompt, image])
+        response = model.generate_content([prompt, image])
         return response.text
-        
     except Exception as e:
-        return f"ERROR: ছবি প্রসেস করতে সমস্যা হয়েছে ({str(e)})"
+        return f"ERROR: ছবি প্রসেস করতে সমস্যা হয়েছে ({str(e)})"
 
 
-load_dotenv()
-groq_api_key = os.getenv("GROQ_API_KEY")
-
-# def get_voice_input():
-#     r = sr.Recognizer()
-#     with sr.Microphone() as source:
-#         st.info("🎤( Listening...)")
-#         # ব্যাকগ্রাউন্ড নয়েজ কমানোর জন্য
-#         r.adjust_for_ambient_noise(source) 
-#         try:
-#             audio = r.listen(source, timeout=5)
-#             # language="bn-BD" দিলে বাংলা বুঝবে, "en-US" দিলে ইংরেজি
-#             text = r.recognize_google(audio, language="bn-BD") 
-#             return text
-#         except sr.UnknownValueError:
-#             st.error("দুঃখিত, আমি কথাটি ঠিকমতো বুঝতে পারিনি।")
-#             return None
-#         except sr.RequestError:
-#             st.error("ইন্টারনেট কানেকশনে সমস্যা হচ্ছে!")
-#             return None
-#         except Exception as e:
-#             return None
+def extract_text_gemini(image):
+    if not gemini_api_key:
+        return "ERROR: Gemini API key পাওয়া যায়নি।"
+    try:
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        prompt = """
+        You are an expert pharmacist. Read this medical prescription or lab report carefully.
+        Extract: medicine names, dosages, duration, and any medical advice.
+        Format the extracted text neatly. Do not give medical advice.
+        """
+        response = model.generate_content([prompt, image])
+        return response.text.strip()
+    except Exception as e:
+        return f"ERROR: Gemini OCR ব্যর্থ হয়েছে ({str(e)})"
 
 
-st.set_page_config(page_title="Personal Medical Assistant", page_icon="👩🏻‍⚕️")
-st.title("👩🏻‍⚕️ Personal Medical Assistant")
-st.caption("আপনার স্বাস্থ্য বিষয়ক যেকোনো প্রশ্ন করুন (বাংলা বা ইংরেজিতে)।")
+# ─── Page Config ──────────────────────────────────────────────────────
+st.set_page_config(page_title="MediAssist AI", page_icon="👩🏻‍⚕️", layout="wide")
+st.title("👩🏻‍⚕️ MediAssist AI — Personal Medical Assistant")
+st.caption("আপনার স্বাস্থ্য বিষয়ক যেকোনো প্রশ্ন করুন (বাংলা, ইংরেজি বা Banglish-এ)।")
+
+if not groq_api_key:
+    st.error("⚠️ GROQ_API_KEY পাওয়া যায়নি। HF Space Settings → Secrets এ add করুন।")
+    st.stop()
 
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "ocr_confirmed_text" not in st.session_state:
-    st.session_state.ocr_confirmed_text = None
-if "ocr_extracted_text" not in st.session_state:
-    st.session_state.ocr_extracted_text = None
-if "ui_language" not in st.session_state:
-    st.session_state.ui_language = "বাংলা"
-if "last_uploaded_file" not in st.session_state:
-    st.session_state.last_uploaded_file = None
+# ─── Session State Init ───────────────────────────────────────────────
+defaults = {
+    "messages": [],
+    "chat_history": [],
+    "ocr_confirmed_text": None,
+    "ocr_extracted_text": None,
+    "ui_language": "বাংলা",
+    "last_uploaded_file": None,
+    "vision_extracted_symptoms": None,
+    "rag_chain": None,
+}
+for key, val in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
 
 
+# ─── Display Chat History ─────────────────────────────────────────────
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
 
-
-# ─── Visual Symptom Checker (Vision) ──────────────────────────────────
-st.sidebar.markdown("---")
-st.sidebar.subheader("👁️ Visual Symptom Checker")
-st.sidebar.caption("লক্ষণ বুঝতে ছবি আপলোড করুন (Powered by Gemini)")
-
-# ছবি আপলোডের জন্য file uploader
-vision_upload = st.sidebar.file_uploader(
-    "লক্ষণ চেক করতে ছবি আপলোড করুন (JPG/PNG)", 
-    type=["jpg", "jpeg", "png"], 
-    key="vision_uploader"
-)
-
-# যদি Session State-এ ভিশনের ডেটা না থাকে
-if "vision_extracted_symptoms" not in st.session_state:
-    st.session_state.vision_extracted_symptoms = None
-
-if vision_upload:
-    vision_image = Image.open(vision_upload)
-    st.sidebar.image(
-        vision_image, 
-        caption="আপলোড করা ছবি", 
-        use_container_width=True
-    )
-    
-    # বিশ্লেষণ করার বাটন
-    if st.sidebar.button("🔍 লক্ষণ বিশ্লেষণ করুন"):
-        with st.spinner("ছবি বিশ্লেষণ করা হচ্ছে..."):
-            # তোমার আগে লেখা ফাংশনটি কল করা হচ্ছে
-            symptoms = analyze_symptoms_from_image(vision_image)
-            st.session_state.vision_extracted_symptoms = symptoms
-            
-    # ফলাফল দেখানো
-    if st.session_state.vision_extracted_symptoms:
-        if not st.session_state.vision_extracted_symptoms.startswith("ERROR"):
-            st.sidebar.success("✅ বিশ্লেষণ সম্পন্ন!")
-            st.sidebar.info(f"**প্রাথমিক লক্ষণ:**\n{st.session_state.vision_extracted_symptoms}")
-            st.sidebar.caption("💡 এই লক্ষণগুলোর ভিত্তিতে নিচে মূল চ্যাটে প্রশ্ন করতে পারেন।")
-        else:
-            st.sidebar.error(st.session_state.vision_extracted_symptoms)
-
-
-
-
-def extract_text_gemini(image):
-    """Gemini 2.5 Flash ব্যবহার করে প্রেসক্রিপশন বা রিপোর্ট থেকে টেক্সট বের করা"""
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        
-        ocr_prompt = """
-        You are an expert pharmacist and medical document reader. 
-        Carefully read this medical prescription or lab report. 
-        Extract all the text, focusing heavily on:
-        1. Medicine names
-        2. Dosages (e.g., 500mg, 1+0+1)
-        3. Duration (e.g., for 5 days)
-        4. Any medical advice or test results.
-        If it's handwritten, use your medical knowledge to accurately decipher the terms.
-        Format the extracted text neatly. Do not give any medical advice here, just extract the text.
-        """
-        
-        response = model.generate_content([ocr_prompt, image])
-        return response.text.strip()
-        
-    except Exception as e:
-        return f"ERROR: Gemini OCR ব্যর্থ হয়েছে ({str(e)})"
-
-
-
-# ------------------Sidebar Settings -------------------------------
-
-with st.sidebar:
-    st.header("📊 Health Dashboard")
-    st.write("আপনার প্রাথমিক স্বাস্থ্য তথ্য দিন:")
-    
-    # ইউজারের ইনপুট নেওয়া
-    weight = st.number_input("ওজন (Weight in kg)", min_value=10.0, max_value=200.0, value=70.0, step=0.5)
-    height_cm = st.number_input("উচ্চতা (Height in cm)", min_value=50.0, max_value=250.0, value=170.0, step=1.0)
-    
-    # ক্যালকুলেট বাটন
-    if st.button("Calculate BMI & Stats"):
-        # BMI হিসাব করা (ওজন / উচ্চতা^2)
-        height_m = height_cm / 100
-        bmi = weight / (height_m ** 2)
-        
-        # পানির চাহিদা হিসাব করা (প্রতি কেজি ওজনের জন্য আনুমানিক ৩৫ মিলি)
-        water_intake = (weight * 35) / 1000
-        
-        st.markdown("---")
-        st.subheader("আপনার ফলাফল (Results):")
-        st.write(f"**BMI:** {bmi:.2f}")
-        
-        # BMI ক্যাটাগরি অনুযায়ী মেসেজ
-        if bmi < 18.5:
-            st.warning("Category: Underweight 📉 (ওজন কম)")
-        elif 18.5 <= bmi < 24.9:
-            st.success("Category: Normal Weight ✅ (স্বাভাবিক)")
-        elif 25 <= bmi < 29.9:
-            st.warning("Category: Overweight 📈 (ওজন বেশি)")
-        else:
-            st.error("Category: Obese ⚠️ (স্থূলতা)")
-        
-        st.write(f"**দৈনিক পানির চাহিদা:** {water_intake:.1f} লিটার 💧")
-        
-        st.info("💡 টিপস: আপনি চাইলে এই ফলাফলের ওপর ভিত্তি করে মেইন চ্যাটে এআই-এর কাছে একটি ডায়েট প্ল্যান চাইতে পারেন!")
-
-
-
-# ─── RAG Pipeline ─────────────────────────────────────────────────────
+# ─── RAG Pipeline (Modern LangChain) ─────────────────────────────────
 @st.cache_resource
 def load_rag_pipeline():
-
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     )
+
+    chroma_path = "./chroma_db"
+    if not os.path.exists(chroma_path):
+        chroma_path = "/app/chroma_db"
+
     vector_db = Chroma(
-        persist_directory="./chroma_db", embedding_function=embeddings
+        persist_directory=chroma_path,
+        embedding_function=embeddings
     )
     retriever = vector_db.as_retriever(search_kwargs={"k": 3})
 
@@ -220,374 +114,523 @@ def load_rag_pipeline():
         temperature=0.3
     )
 
-    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+    # ── Contextualize question using chat history ──
+    contextualize_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "Given the chat history and the latest user question, "
          "reformulate the question to be standalone and clear. "
-         "Do NOT answer the question, just rephrase it if needed. "
-         "If it's already clear, return it as is."
-         ),
+         "Do NOT answer it, just rephrase if needed. Return as is if already clear."),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}"),
     ])
 
-    history_aware_retriever = create_history_aware_retriever(
-        llm, retriever, contextualize_q_prompt
-    )
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
 
+    def get_context(x):
+        # Reformulate question with history
+        if x["chat_history"]:
+            reformulate_chain = contextualize_prompt | llm | StrOutputParser()
+            question = reformulate_chain.invoke({
+                "input": x["input"],
+                "chat_history": x["chat_history"]
+            })
+        else:
+            question = x["input"]
+        docs = retriever.invoke(question)
+        return format_docs(docs)
+
+    # ── Main QA Prompt ──
     system_prompt = (
         "You are MediAssist AI, a knowledgeable and compassionate Medical Information Assistant. "
-        "Your role is to provide accurate, helpful, and easy-to-understand health information based on the given context. "
+        "Your role is to provide accurate, helpful health information based on the given context.\n\n"
 
-        "\n\n### CORE RULES ###\n"
-        "- ONLY use information from the provided context to answer questions. "
-        "- If the context lacks sufficient information, respond with: 'I'm sorry, I don't have enough information on this topic. Please consult a qualified doctor.' "
-        "- NEVER invent, guess, or hallucinate any medical information, drug names, or dosages. "
-        "- NEVER provide a specific diagnosis. You can explain symptoms and conditions, but always clarify you are an AI, not a doctor. "
+        "### CORE RULES ###\n"
+        "- ONLY use information from the provided context.\n"
+        "- If context lacks info, say: 'I don't have enough information. Please consult a doctor.'\n"
+        "- NEVER invent medical information, drug names, or dosages.\n"
+        "- NEVER provide a specific diagnosis.\n\n"
 
-        "\n\n### LANGUAGE RULES ###\n"
-        "- Always reply in the SAME language the user used. "
-        "- If the user writes in Bengali, reply fully in Bengali. If in English, reply in English. "
-        "- If the user explicitly asks for a translation (e.g., 'এটা ইংরেজিতে বলো' or 'say this in Bengali'), switch to that language. "
-        "- The user may also write in 'Banglish' (Bengali words written in English letters, e.g., 'ami jore bugtesi' means 'I have fever'). "
-        "- If the user writes in Banglish, understand it as Bengali and reply in proper Bengali script. "
-        "- Common Banglish medical terms to understand: 'jore bugti/bugtesi' = fever, 'mathay betha' = headache, "
+        "### LANGUAGE RULES ###\n"
+        "- Reply in the SAME language the user used.\n"
+        "- Bengali input → Bengali reply. English input → English reply.\n"
+        "- Banglish input (Bengali in English letters) → reply in proper Bengali script.\n"
+        "- Common Banglish terms: 'jore bugti' = fever, 'mathay betha' = headache, "
         "'buk betha' = chest pain, 'pet betha' = stomach pain, 'shash kosto' = breathing difficulty, "
-        "'durbolta' = weakness, 'bomi' = vomiting, 'pায়খানা' = diarrhea, 'ghum nai' = insomnia, "
-        "'khide nai' = loss of appetite, 'shordi' = cold/cough, 'khansi' = cough. "
-        "- If unsure about a Banglish word's meaning, try to interpret it based on context and reply in Bengali. "
+        "'durbolta' = weakness, 'bomi' = vomiting, 'shordi' = cold, 'khansi' = cough.\n\n"
 
-        "\n\n### FORMATTING RULES ###\n"
-        "- For lists of symptoms, diseases, or medicines: use bullet points with ➡️ emoji, one point per line. Always use line breaks for readability. "
-        "- For step-by-step instructions or processes: use numbered lists (1. 2. 3.), one step per line. Always use line breaks for readability. "
-        "- For complex topics: use clear headings with **bold** text to separate sections. Always use line breaks for readability. "
-        "- Keep answers concise. For simple questions, give short answers. For complex questions, give detailed but structured answers. "
-        "- Never put two separate ideas in a single line. Always use line breaks for readability. "
+        "### FORMATTING ###\n"
+        "- Symptoms/medicines list: use ➡️ bullet points, one per line.\n"
+        "- Step-by-step: use numbered lists.\n"
+        "- Complex topics: use **bold** headings.\n\n"
 
-        "\n\n### EMERGENCY PROTOCOL ###\n"
-        "- If the user describes emergency symptoms such as: chest pain with sweating, difficulty breathing, severe bleeding, loss of consciousness, stroke symptoms, or severe allergic reaction — "
-        "IMMEDIATELY start your response with: '🚨 EMERGENCY ALERT: Please call emergency services or go to the nearest hospital RIGHT NOW!' "
-        "- Do not wait to give other information before showing the emergency alert. "
+        "### EMERGENCY PROTOCOL ###\n"
+        "- For emergency symptoms (chest pain + sweating, breathing difficulty, severe bleeding, "
+        "loss of consciousness, stroke) → IMMEDIATELY say: "
+        "'🚨 EMERGENCY ALERT: Please call emergency services or go to the nearest hospital RIGHT NOW!'\n\n"
 
-        "\n\n### SPECIALIST RECOMMENDATION ###\n"
-        "- If the user asks who to consult, recommend the most appropriate medical specialist based on their symptoms. "
-        "- Examples: chest pain → Cardiologist, skin issues → Dermatologist, headaches/seizures → Neurologist, mental health → Psychiatrist, child health → Pediatrician. "
-        "- Always phrase it as a recommendation, not a diagnosis. "
+        "### SPECIALIST ###\n"
+        "- Chest pain → Cardiologist, Skin → Dermatologist, Headache → Neurologist, "
+        "Mental health → Psychiatrist, Child → Pediatrician.\n\n"
 
-        "\n\n### Website Resources ###\n"
-        "When extracting information from the context, strictly ignore any marketing text, website navigation menus, subscription offers, or promotional content. Focus ONLY on clinical facts, symptoms, treatments, and medical guidelines."
+        "### DISCLAIMER ###\n"
+        "- Always end with: '⚠️ সতর্কতা: আমি একটি এআই মডেল। যেকোনো স্বাস্থ্য সমস্যায় "
+        "একজন রেজিস্টার্ড ডাক্তারের পরামর্শ নিন।'\n\n"
 
-        "\n\n### OCR EXTRACTED TEXT ###\n"
-        "- If the user's input contains text extracted from an image (marked as '[OCR থেকে পাওয়া তথ্য]'), "
-        "treat it as a medical prescription or report. "
-        "- Identify medicine names, dosages, and instructions from the extracted text. "
-        "- If OCR text seems garbled or unclear, mention it and ask the user to clarify. "
-
-        "\n\n### DISCLAIMER ###\n"
-        "- If the user asks for medical advice or treatment suggestions, always end your response with: "
-        "'⚠️ সতর্কতা: আমি একটি এআই মডেল। এটি কোনো চূড়ান্ত মেডিকেল পরামর্শ নয়। যেকোনো স্বাস্থ্য সমস্যায় অবশ্যই একজন রেজিস্টার্ড ডাক্তারের পরামর্শ নিন।' "
-
-        "\n\nContext:\n{context}"
+        "Context:\n{context}"
     )
 
-    prompt = ChatPromptTemplate.from_messages([
+    qa_prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}")
     ])
 
-    question_answer_chain = create_stuff_documents_chain(llm, prompt)
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    # ── Build chain ──
+    chain = (
+        RunnablePassthrough.assign(context=RunnableLambda(get_context))
+        | qa_prompt
+        | llm
+        | StrOutputParser()
+    )
 
-    return rag_chain
+    return chain
 
 
-rag_chain = load_rag_pipeline()
-
-
-# ─── Sidebar Settings ─────────────────────────────────────────────────
+# ─── Sidebar: Settings ────────────────────────────────────────────────
 st.sidebar.title("⚙️ Settings")
-st.session_state.ui_language = st.sidebar.radio(
-    "OCR Confirmation Language / ভাষা বেছে নিন:",
-    ["বাংলা", "English"]
-)
-
+st.session_state.ui_language = st.sidebar.radio("Language / ভাষা:", ["বাংলা", "English"])
 is_bangla = st.session_state.ui_language == "বাংলা"
 
 
-# ─── OCR Section ──────────────────────────────────────────────────────
+# ─── Sidebar: Health Dashboard ────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.header("📊 Health Dashboard")
+st.sidebar.write("আপনার প্রাথমিক স্বাস্থ্য তথ্য দিন:")
+
+weight    = st.sidebar.number_input("ওজন (kg)",  min_value=10.0,  max_value=200.0, value=70.0,  step=0.5)
+height_cm = st.sidebar.number_input("উচ্চতা (cm)", min_value=50.0, max_value=250.0, value=170.0, step=1.0)
+
+if st.sidebar.button("Calculate BMI & Stats"):
+    bmi          = weight / ((height_cm / 100) ** 2)
+    water_intake = (weight * 35) / 1000
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("আপনার ফলাফল:")
+    st.sidebar.write(f"**BMI:** {bmi:.2f}")
+    if bmi < 18.5:      st.sidebar.warning("Underweight 📉")
+    elif bmi < 24.9:    st.sidebar.success("Normal Weight ✅")
+    elif bmi < 29.9:    st.sidebar.warning("Overweight 📈")
+    else:               st.sidebar.error("Obese ⚠️")
+    st.sidebar.write(f"**দৈনিক পানির চাহিদা:** {water_intake:.1f} লিটার 💧")
+    st.sidebar.info("💡 মেইন চ্যাটে ডায়েট প্ল্যান চাইতে পারেন!")
+
+
+# ─── Sidebar: Visual Symptom Checker ─────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.subheader("👁️ Visual Symptom Checker")
+st.sidebar.caption("লক্ষণ বুঝতে ছবি আপলোড করুন (Powered by Gemini Vision)")
+
+vision_upload = st.sidebar.file_uploader(
+    "ছবি আপলোড করুন (JPG/PNG)", type=["jpg", "jpeg", "png"], key="vision_uploader"
+)
+if vision_upload:
+    vision_image = Image.open(vision_upload)
+    st.sidebar.image(vision_image, caption="আপলোড করা ছবি", use_container_width=True)
+    if st.sidebar.button("🔍 লক্ষণ বিশ্লেষণ করুন"):
+        with st.spinner("ছবি বিশ্লেষণ করা হচ্ছে..."):
+            st.session_state.vision_extracted_symptoms = analyze_symptoms_from_image(vision_image)
+
+    if st.session_state.vision_extracted_symptoms:
+        if not st.session_state.vision_extracted_symptoms.startswith("ERROR"):
+            st.sidebar.success("✅ বিশ্লেষণ সম্পন্ন!")
+            st.sidebar.info(f"**প্রাথমিক লক্ষণ:**\n{st.session_state.vision_extracted_symptoms}")
+        else:
+            st.sidebar.error(st.session_state.vision_extracted_symptoms)
+
+
+# ─── Sidebar: Prescription OCR ───────────────────────────────────────
 st.sidebar.markdown("---")
 st.sidebar.subheader("📄 Prescription / Report OCR")
-st.sidebar.caption(
-    "🔍 EasyOCR দ্বারা পরিচালিত (সম্পূর্ণ local)"
-    if is_bangla
-    else "🔍 Powered by EasyOCR (fully local)"
-)
+st.sidebar.caption("🔍 Gemini Vision দ্বারা পরিচালিত" if is_bangla else "🔍 Powered by Gemini Vision")
 
-upload_label = (
-    "ছবি আপলোড করুন (JPG/PNG)"
-    if is_bangla
-    else "Upload Image (JPG/PNG)"
-)
+upload_label  = "প্রেসক্রিপশন / রিপোর্টের ছবি আপলোড করুন" if is_bangla else "Upload Prescription / Report Image"
 uploaded_image = st.sidebar.file_uploader(upload_label, type=["jpg", "jpeg", "png"])
 
 if uploaded_image:
-    # নতুন ছবি upload হলে state reset করো
     if st.session_state.last_uploaded_file != uploaded_image.name:
-        st.session_state.ocr_extracted_text = None
-        st.session_state.ocr_confirmed_text = None
-        st.session_state.last_uploaded_file = uploaded_image.name
+        st.session_state.ocr_extracted_text  = None
+        st.session_state.ocr_confirmed_text  = None
+        st.session_state.last_uploaded_file  = uploaded_image.name
 
     image = Image.open(uploaded_image)
-    st.sidebar.image(
-        image,
-        caption="আপলোড করা ছবি" if is_bangla else "Uploaded Image",
-        use_container_width=True
-    )
+    st.sidebar.image(image, caption="আপলোড করা ছবি" if is_bangla else "Uploaded Image", use_container_width=True)
 
-    # শুধু প্রথমবার OCR চালাও
     if st.session_state.ocr_extracted_text is None:
-        with st.spinner(
-            "🔍 OCR processing হচ্ছে, একটু অপেক্ষা করুন..."
-            if is_bangla
-            else "🔍 Processing OCR, please wait..."
-        ):
-            extracted = extract_text_gemini(image)
-            st.session_state.ocr_extracted_text = extracted
+        with st.spinner("🔍 OCR processing হচ্ছে..." if is_bangla else "🔍 Processing OCR..."):
+            st.session_state.ocr_extracted_text = extract_text_gemini(image)
             st.session_state.ocr_confirmed_text = None
 
-    # ─── Confirmation Block ───────────────────────────────────────────
-    if (
-        st.session_state.ocr_extracted_text
-        and not st.session_state.ocr_extracted_text.startswith("ERROR")
-        and st.session_state.ocr_confirmed_text is None
-    ):
-        if is_bangla:
-            st.info("📋 ছবি থেকে নিচের text পাওয়া গেছে। এটা কি সঠিক?")
-        else:
-            st.info("📋 The following text was extracted from the image. Is this correct?")
-
-        # Editable text area — user চাইলে ঠিক করতে পারবে
-        edited_text = st.text_area(
-            "✏️ প্রয়োজনে সম্পাদনা করুন:" if is_bangla else "✏️ Edit if needed:",
-            value=st.session_state.ocr_extracted_text,
-            height=150
-        )
-
+    if (st.session_state.ocr_extracted_text
+            and not st.session_state.ocr_extracted_text.startswith("ERROR")
+            and st.session_state.ocr_confirmed_text is None):
+        st.info("📋 ছবি থেকে text পাওয়া গেছে। এটা কি সঠিক?" if is_bangla else "📋 Text extracted. Is this correct?")
+        edited_text = st.text_area("✏️ প্রয়োজনে সম্পাদনা করুন:" if is_bangla else "✏️ Edit if needed:",
+                                   value=st.session_state.ocr_extracted_text, height=150)
         col1, col2 = st.columns(2)
-
         with col1:
-            confirm_label = "✅ হ্যাঁ, সঠিক" if is_bangla else "✅ Confirm"
-            if st.button(confirm_label):
+            if st.button("✅ হ্যাঁ, সঠিক" if is_bangla else "✅ Confirm"):
                 st.session_state.ocr_confirmed_text = edited_text
-                if is_bangla:
-                    st.success("✅ Text confirm হয়েছে! নিচে প্রশ্ন করুন।")
-                else:
-                    st.success("✅ Confirmed! Ask your question below.")
-
+                st.success("✅ Confirmed!")
         with col2:
-            retry_label = "🔄 আবার চেষ্টা" if is_bangla else "🔄 Retry"
-            if st.button(retry_label):
+            if st.button("🔄 আবার চেষ্টা" if is_bangla else "🔄 Retry"):
                 st.session_state.ocr_extracted_text = None
                 st.session_state.ocr_confirmed_text = None
                 st.rerun()
 
-    # ─── Error Block ──────────────────────────────────────────────────
-    elif (
-        st.session_state.ocr_extracted_text
-        and st.session_state.ocr_extracted_text.startswith("ERROR")
-    ):
-        if is_bangla:
-            st.error(f"❌ OCR ব্যর্থ হয়েছে: {st.session_state.ocr_extracted_text}")
-            st.warning("আবার চেষ্টা করতে নিচের বোতাম চাপুন।")
-        else:
-            st.error(f"❌ OCR failed: {st.session_state.ocr_extracted_text}")
-            st.warning("Press the button below to retry.")
+    elif (st.session_state.ocr_extracted_text
+            and st.session_state.ocr_extracted_text.startswith("ERROR")):
+        st.error(f"❌ OCR ব্যর্থ: {st.session_state.ocr_extracted_text}")
 
-        if st.button("🔄 Retry" if not is_bangla else "🔄 আবার চেষ্টা করুন"):
-            st.session_state.ocr_extracted_text = None
-            st.session_state.ocr_confirmed_text = None
-            st.rerun()
-
-    # ─── Confirmed Block ──────────────────────────────────────────────
     elif st.session_state.ocr_confirmed_text:
-        if is_bangla:
-            st.sidebar.success("✅ OCR Text confirm হয়েছে।")
-        else:
-            st.sidebar.success("✅ OCR Text confirmed.")
-
-        reset_label = "🗑️ OCR রিসেট করুন" if is_bangla else "🗑️ Reset OCR"
-        if st.sidebar.button(reset_label):
+        st.sidebar.success("✅ OCR confirmed.")
+        if st.sidebar.button("🗑️ Reset OCR"):
             st.session_state.ocr_extracted_text = None
             st.session_state.ocr_confirmed_text = None
             st.session_state.last_uploaded_file = None
             st.rerun()
 
-elif not uploaded_image:
-    # ছবি না থাকলে state reset করো
-    if st.session_state.last_uploaded_file is not None:
-        st.session_state.ocr_extracted_text = None
-        st.session_state.ocr_confirmed_text = None
-        st.session_state.last_uploaded_file = None
+elif st.session_state.last_uploaded_file is not None:
+    st.session_state.ocr_extracted_text = None
+    st.session_state.ocr_confirmed_text = None
+    st.session_state.last_uploaded_file = None
 
 
-# ─── Chat Input (Voice + Text) ────────────────────────────────────────
+# ─── Sidebar: Hospital & Specialist Finder ────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.subheader("🏥 Nearby Hospital Finder")
+st.sidebar.caption("আপনার কাছের হাসপাতাল বা বিশেষজ্ঞ খুঁজুন")
 
-# chat_placeholder = (
-#     "আপনার লক্ষণ বা সমস্যার কথা লিখুন..."
-#     if is_bangla
-#     else "Type your symptoms or question..."
-# )
+# District selection
+bangladesh_districts = [
+    "Dhaka", "Chittagong (Chattogram)", "Sylhet", "Rajshahi", "Khulna",
+    "Barishal", "Rangpur", "Mymensingh", "Comilla", "Narayanganj",
+    "Gazipur", "Tangail", "Bogura", "Jessore (Jashore)", "Cox's Bazar",
+    "Dinajpur", "Pabna", "Brahmanbaria", "Sirajganj", "Noakhali",
+    "Faridpur", "Narsingdi", "Kishoreganj", "Habiganj", "Moulvibazar",
+    "Sunamganj", "Netrokona", "Sherpur", "Jamalpur", "Magura",
+    "Kushtia", "Meherpur", "Chuadanga", "Jhenaidah", "Narail",
+    "Satkhira", "Bagerhat", "Pirojpur", "Jhalokathi", "Patuakhali",
+    "Bhola", "Barguna", "Lakshmipur", "Chandpur", "Feni",
+    "Khagrachhari", "Rangamati", "Bandarban", "Natore", "Chapainawabganj",
+    "Naogaon", "Joypurhat", "Thakurgaon", "Panchagarh", "Nilphamari",
+    "Lalmonirhat", "Kurigram", "Gaibandha", "Jashore", "Shariatpur",
+    "Madaripur", "Gopalganj", "Munshiganj", "Manikganj", "Rajbari"
+]
 
-# # ১. টেক্সট এবং ভয়েস ইনপুট ভেরিয়েবল সেট করা
-# text_input = st.chat_input(chat_placeholder)
-# voice_input = None
+specialist_types = [
+    "হাসপাতাল (General Hospital)",
+    "হৃদরোগ বিশেষজ্ঞ (Cardiologist)",
+    "চর্মরোগ বিশেষজ্ঞ (Dermatologist)",
+    "স্নায়ু বিশেষজ্ঞ (Neurologist)",
+    "শিশু বিশেষজ্ঞ (Pediatrician)",
+    "মানসিক স্বাস্থ্য (Psychiatrist)",
+    "হাড় বিশেষজ্ঞ (Orthopedic)",
+    "চক্ষু বিশেষজ্ঞ (Ophthalmologist)",
+    "দন্ত চিকিৎসক (Dentist)",
+    "ডায়াবেটিস বিশেষজ্ঞ (Diabetologist)",
+    "কিডনি বিশেষজ্ঞ (Nephrologist)",
+    "ক্যান্সার বিশেষজ্ঞ (Oncologist)",
+    "গাইনি বিশেষজ্ঞ (Gynecologist)",
+    "ইএনটি বিশেষজ্ঞ (ENT Specialist)",
+]
 
-# # ২. ভয়েস বাটন ক্লিক হলে অডিও থেকে টেক্সট নেওয়া
-# if st.button("🎤 কথা বলে প্রশ্ন করুন"):
-#     voice_input = get_voice_input()
-#     if voice_input:
-#         st.success(f"আপনি বলেছেন: {voice_input}")
+selected_district  = st.sidebar.selectbox("আপনার জেলা বেছে নিন:", bangladesh_districts)
+selected_specialist = st.sidebar.selectbox("কী ধরনের সাহায্য দরকার?", specialist_types)
 
-# # ৩. চূড়ান্ত ইনপুট: ইউজার টাইপ করুক বা কথা বলুক, যেকোনো একটি পেলেই কাজ করবে
-# user_input = text_input or voice_input
+if st.sidebar.button("🔍 হাসপাতাল খুঁজুন"):
+    # Build Google Maps search query
+    specialist_en = selected_specialist.split("(")[-1].replace(")", "").strip()
+    query = f"{specialist_en} hospital near {selected_district} Bangladesh"
+    maps_url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
 
-# if user_input:
-#     # শুরুতে ইউজারের মূল প্রশ্নটি নিলাম
-#     combined_input = user_input
+    st.sidebar.success(f"✅ **{selected_district}** এ **{selected_specialist}** খোঁজা হচ্ছে!")
+    st.sidebar.markdown(f"### 🗺️ [Google Maps এ দেখুন →]({maps_url})")
+    st.sidebar.info(
+        "💡 **টিপস:**\n"
+        "- লিংকে click করলে Google Maps খুলবে\n"
+        "- Rating ও Reviews দেখে হাসপাতাল বেছে নিন\n"
+        "- যাওয়ার আগে phone করে appointment নিন\n"
+        "- জরুরি অবস্থায় সরাসরি চলে যান"
+    )
+    st.sidebar.warning(
+        "⚠️ MediAssist AI কোনো নির্দিষ্ট হাসপাতালকে recommend করে না। "
+        "Google Maps এর তথ্য যাচাই করে নিন।"
+    )
 
-#     # ১. OCR টেক্সট থাকলে সেটি যুক্ত করো
-#     if st.session_state.get("ocr_confirmed_text"):
-#         combined_input += (
-#             f"\n\n[OCR রিপোর্ট/প্রেসক্রিপশন থেকে পাওয়া তথ্য]:\n"
-#             f"{st.session_state.ocr_confirmed_text}"
-#         )
-
-#     # ২. Vision থেকে পাওয়া লক্ষণ থাকলে সেটিও যুক্ত করো (নতুন লজিক 🚀)
-#     vision_symptoms = st.session_state.get("vision_extracted_symptoms")
-#     if vision_symptoms and not vision_symptoms.startswith("ERROR"):
-#         combined_input += (
-#             f"\n\n[রোগীর আপলোড করা ছবির লক্ষণ]:\n"
-#             f"{vision_symptoms}"
-#         )
-
-#     # ইউজারের মেসেজ UI-তে দেখানো (ইউজার শুধু তার টাইপ করা অংশটুকুই দেখবে)
-#     with st.chat_message("user"):
-#         st.markdown(user_input)
-#     st.session_state.messages.append({"role": "user", "content": user_input})
-
-#     # এআই-এর উত্তর জেনারেট করা
-#     with st.chat_message("assistant"):
-#         with st.spinner("Processing..." if not is_bangla else "বই থেকে তথ্য খোঁজা হচ্ছে..."):
-#             response = rag_chain.invoke({
-#                 "input": combined_input, # এখন Groq ইউজারের প্রশ্ন + ছবি + OCR সবকিছু একসাথেই পাবে!
-#                 "chat_history": st.session_state.chat_history
-#             })
-#             answer = response["answer"]
-#             st.markdown(answer)
-
-#     # মেমোরি (History) আপডেট করা
-#     st.session_state.chat_history.append(HumanMessage(content=combined_input))
-#     st.session_state.chat_history.append(AIMessage(content=answer))
-#     st.session_state.messages.append({"role": "assistant", "content": answer})
+st.sidebar.markdown("---")
+st.sidebar.markdown("🆘 **জরুরি: 999 call করুন**")
 
 
-# ─── Chat Input (Text Only for Cloud) ────────────────────────────────────────
+# ─── Emergency Numbers Section (Main Area) ───────────────────────────
+with st.expander("🚨 জরুরি হেল্পলাইন নম্বর — Emergency Helpline Numbers (ক্লিক করুন)"):
+    st.markdown("### 🇧🇩 বাংলাদেশ জরুরি হেল্পলাইন")
+    st.markdown("---")
 
-chat_placeholder = (
-    "আপনার লক্ষণ বা সমস্যার কথা লিখুন..."
-    if is_bangla
-    else "Type your symptoms or question..."
+    # Row 1 - Main Emergency
+    st.markdown("#### 🚑 প্রধান জরুরি সেবা")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.error("**999**")
+        st.markdown("পুলিশ / ফায়ার / অ্যাম্বুলেন্স\n*(24/7 available)*")
+    with col2:
+        st.error("**16263**")
+        st.markdown("DGHS স্বাস্থ্য হেল্পলাইন\n*(Health Emergency)*")
+    with col3:
+        st.error("**333**")
+        st.markdown("জাতীয় স্বাস্থ্য সেবা\n*(Health Helpline)*")
+
+    st.markdown("---")
+
+    # Row 2 - Health Services
+    st.markdown("#### 🏥 স্বাস্থ্য সেবা")
+    col4, col5, col6 = st.columns(3)
+    with col4:
+        st.warning("**16000**")
+        st.markdown("জাতীয় হেল্পলাইন\n*(National Helpline)*")
+    with col5:
+        st.warning("**09611667777**")
+        st.markdown("বিষ নিয়ন্ত্রণ কেন্দ্র\n*(Poison Control)*")
+    with col6:
+        st.warning("**10655**")
+        st.markdown("মানসিক স্বাস্থ্য\n*(Mental Health)*")
+
+    st.markdown("---")
+
+    # Row 3 - Women & Children
+    st.markdown("#### 👩‍👧 নারী ও শিশু সেবা")
+    col7, col8, col9, col10 = st.columns(4)
+    with col7:
+        st.info("**109**")
+        st.markdown("নারী হেল্পলাইন\n*(Women Helpline)*")
+    with col8:
+        st.info("**10921**")
+        st.markdown("নারী সহায়তা\n*(Women Support)*")
+    with col9:
+        st.info("**1098**")
+        st.markdown("শিশু হেল্পলাইন\n*(Child Helpline)*")
+    with col10:
+        st.info("**16430**")
+        st.markdown("আইনি সহায়তা\n*(Legal Aid)*")
+
+    st.markdown("---")
+    st.caption(
+        "⚠️ জরুরি অবস্থায় সরাসরি **999** dial করুন। "
+        "উপরের নম্বরগুলো Bangladesh-এর সরকারি হেল্পলাইন।"
+    )
+
+
+# ─── Smart Symptom Detection + MCQ Triage ────────────────────────────
+
+for k, v in {
+    "triage_active": False,
+    "triage_questions": [],
+    "triage_original_input": "",
+    "triage_answers": {},
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+def is_symptom_query(text: str) -> bool:
+    symptom_keywords = [
+        "ব্যথা", "বেথা", "জ্বর", "কাশি", "শ্বাস", "বমি", "মাথা", "বুক",
+        "পেট", "গলা", "চোখ", "কান", "নাক", "হাত", "পা", "দুর্বল", "ক্লান্ত",
+        "ঘুম", "খিদে", "র্যাশ", "চুলকানি", "ফোলা", "রক্ত", "ডায়রিয়া",
+        "betha", "jor", "jore", "bugti", "bugtesi", "kashi", "shash", "bomi",
+        "matha", "buk", "pet", "gola", "chokh", "kan", "nak", "durbolta",
+        "ghum", "khide", "rash", "cholkani", "fola", "shordi", "khansi",
+        "mathay", "pate", "buke",
+        "pain", "fever", "cough", "headache", "nausea", "vomit", "dizzy",
+        "tired", "weak", "rash", "swelling", "bleeding", "diarrhea",
+        "chest", "stomach", "throat", "eye", "ear", "breathing", "itching",
+        "burning", "ache", "sore", "hurt", "suffering", "feeling",
+    ]
+    return any(kw in text.lower() for kw in symptom_keywords)
+
+
+def generate_triage_questions(symptom_text: str) -> list:
+    try:
+        from groq import Groq
+        import json
+        client = Groq(api_key=groq_api_key)
+        prompt = f"""A patient described: "{symptom_text}"
+Generate 3-5 MCQ questions to understand this condition better.
+Rules:
+- Match the patient language (Bengali input = Bengali questions)
+- Each question has exactly 4 options
+- Return ONLY valid JSON, no extra text
+
+JSON format:
+{{
+  "questions": [
+    {{"id": 1, "question": "question text", "options": ["A", "B", "C", "D"]}}
+  ]
+}}"""
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+        raw = response.choices[0].message.content.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip()).get("questions", [])
+    except Exception:
+        return []
+
+
+# ─── Main Chat ────────────────────────────────────────────────────────
+placeholder = (
+    "আপনার লক্ষণ বা সমস্যার কথা লিখুন (বাংলা, ইংরেজি বা Banglish)..."
+    if is_bangla else
+    "Type your symptoms or question (Bengali, English or Banglish)..."
 )
 
-# ক্লাউডের জন্য শুধু টেক্সট ইনপুট নেওয়া হচ্ছে (ভয়েস বাটন বাদ দেওয়া হলো)
-user_input = st.chat_input(chat_placeholder)
-
-if user_input:
-    # শুরুতে ইউজারের মূল প্রশ্নটি নিলাম
-    combined_input = user_input
-
-    # ১. OCR টেক্সট থাকলে সেটি যুক্ত করো
-    if st.session_state.get("ocr_confirmed_text"):
-        combined_input += (
-            f"\n\n[OCR রিপোর্ট/প্রেসক্রিপশন থেকে পাওয়া তথ্য]:\n"
-            f"{st.session_state.ocr_confirmed_text}"
-        )
-
-    # ২. Vision থেকে পাওয়া লক্ষণ থাকলে সেটিও যুক্ত করো
-    vision_symptoms = st.session_state.get("vision_extracted_symptoms")
-    if vision_symptoms and not vision_symptoms.startswith("ERROR"):
-        combined_input += (
-            f"\n\n[রোগীর আপলোড করা ছবির লক্ষণ]:\n"
-            f"{vision_symptoms}"
-        )
-
-    # ইউজারের মেসেজ UI-তে দেখানো (ইউজার শুধু তার টাইপ করা অংশটুকুই দেখবে)
-    with st.chat_message("user"):
-        st.markdown(user_input)
-    st.session_state.messages.append({"role": "user", "content": user_input})
-
-    # এআই-এর উত্তর জেনারেট করা
+# ── Triage MCQ UI ─────────────────────────────────────────────────────
+if st.session_state.triage_active and st.session_state.triage_questions:
     with st.chat_message("assistant"):
-        with st.spinner("Processing..." if not is_bangla else "বই থেকে তথ্য খোঁজা হচ্ছে..."):
-            response = rag_chain.invoke({
-                "input": combined_input, # এখন Groq ইউজারের প্রশ্ন + ছবি + OCR সবকিছু একসাথেই পাবে!
-                "chat_history": st.session_state.chat_history
-            })
-            answer = response["answer"]
-            st.markdown(answer)
+        st.markdown("🩺 **আপনার সমস্যা আরো ভালোভাবে বুঝতে কিছু প্রশ্ন করছি:**" if is_bangla
+                    else "🩺 **To better understand your condition, please answer:**")
+        st.markdown("---")
 
-    # মেমোরি (History) আপডেট করা
-    st.session_state.chat_history.append(HumanMessage(content=combined_input))
-    st.session_state.chat_history.append(AIMessage(content=answer))
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        all_answered = True
+        for q in st.session_state.triage_questions:
+            qid = str(q["id"])
+            selected = st.radio(f"**{q['question']}**", options=q["options"],
+                                key=f"triage_q_{qid}", index=None)
+            if selected:
+                st.session_state.triage_answers[qid] = selected
+            else:
+                all_answered = False
 
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        with col1:
+            submit_clicked = st.button(
+                "✅ উত্তর জমা দিন" if is_bangla else "✅ Submit Answers",
+                disabled=not all_answered, type="primary")
+        with col2:
+            skip_clicked = st.button("⏭️ Skip করুন" if is_bangla else "⏭️ Skip")
 
+        if not all_answered:
+            st.caption("⚠️ সব প্রশ্নের উত্তর দিন তারপর submit করুন।" if is_bangla
+                       else "⚠️ Please answer all questions before submitting.")
 
-# # ─── Chat Input ───────────────────────────────────────────────────────
-# # ভয়েস ইনপুট বাটন
-# if st.button("🎤 কথা বলে প্রশ্ন করুন"):
-#     voice_text = get_voice_input()
-#     if voice_text:
-#         st.success(f"আপনি বলেছেন: {voice_text}")
-#         # এই voice_text টি এখন তুমি তোমার মডেলের কাছে প্রম্পট হিসেবে পাঠিয়ে দিতে পারো!
+        if submit_clicked or skip_clicked:
+            enriched = st.session_state.triage_original_input
+            if submit_clicked and st.session_state.triage_answers:
+                enriched += "\n\n[রোগীর অতিরিক্ত তথ্য]:\n"
+                for q in st.session_state.triage_questions:
+                    ans = st.session_state.triage_answers.get(str(q["id"]), "N/A")
+                    enriched += f"- {q['question']}: {ans}\n"
+            if st.session_state.get("ocr_confirmed_text"):
+                enriched += f"\n\n[OCR]:\n{st.session_state.ocr_confirmed_text}"
+            vision = st.session_state.get("vision_extracted_symptoms")
+            if vision and not vision.startswith("ERROR"):
+                enriched += f"\n\n[ছবির লক্ষণ]:\n{vision}"
 
+            st.session_state.triage_active = False
+            st.session_state.triage_questions = []
+            st.session_state.triage_answers = {}
+            st.session_state.triage_original_input = ""
 
-# chat_placeholder = (
-#     "আপনার লক্ষণ বা সমস্যার কথা লিখুন..."
-#     if is_bangla
-#     else "Type your symptoms or question..."
-# )
-# user_input = st.chat_input(chat_placeholder)
+            with st.chat_message("assistant"):
+                if st.session_state.rag_chain is None:
+                    with st.spinner("লোড হচ্ছে... ⏳"):
+                        st.session_state.rag_chain = load_rag_pipeline()
+                with st.spinner("বিশ্লেষণ করা হচ্ছে... 🔍" if is_bangla else "Analyzing... 🔍"):
+                    try:
+                        answer = st.session_state.rag_chain.invoke({
+                            "input": enriched,
+                            "chat_history": st.session_state.chat_history
+                        })
+                    except Exception as e:
+                        answer = f"❌ সমস্যা: {str(e)}"
+                    st.markdown(answer)
 
-# if user_input:
+            st.session_state.chat_history.extend([
+                HumanMessage(content=enriched), AIMessage(content=answer)
+            ])
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.rerun()
 
-#     if st.session_state.ocr_confirmed_text:
-#         combined_input = (
-#             f"{user_input}\n\n"
-#             f"[OCR থেকে পাওয়া তথ্য / Extracted from image]:\n"
-#             f"{st.session_state.ocr_confirmed_text}"
-#         )
-#     else:
-#         combined_input = user_input
+else:
+    user_input = st.chat_input(placeholder)
 
-#     with st.chat_message("user"):
-#         st.markdown(user_input)
-#     st.session_state.messages.append({"role": "user", "content": user_input})
+    if user_input:
+        with st.chat_message("user"):
+            st.markdown(user_input)
+        st.session_state.messages.append({"role": "user", "content": user_input})
 
-#     with st.chat_message("assistant"):
-#         with st.spinner("Processing..."):
-#             response = rag_chain.invoke({
-#                 "input": combined_input,
-#                 "chat_history": st.session_state.chat_history
-#             })
-#             answer = response["answer"]
+        if is_symptom_query(user_input):
+            with st.spinner("🩺 লক্ষণ বিশ্লেষণ করা হচ্ছে..." if is_bangla else "🩺 Analyzing symptoms..."):
+                questions = generate_triage_questions(user_input)
 
-#             disclaimer = "\n\n---\n*⚠️ সতর্কতা: I am a AI model, not a medical professional. Please consult a registered doctor for any medical concerns.*"
-#             final_answer = answer + disclaimer
+            if questions:
+                st.session_state.triage_active = True
+                st.session_state.triage_questions = questions
+                st.session_state.triage_original_input = user_input
+                st.session_state.triage_answers = {}
+                st.rerun()
+            else:
+                combined = user_input
+                if st.session_state.get("ocr_confirmed_text"):
+                    combined += f"\n\n[OCR]:\n{st.session_state.ocr_confirmed_text}"
+                vision = st.session_state.get("vision_extracted_symptoms")
+                if vision and not vision.startswith("ERROR"):
+                    combined += f"\n\n[ছবির লক্ষণ]:\n{vision}"
+                with st.chat_message("assistant"):
+                    if st.session_state.rag_chain is None:
+                        with st.spinner("লোড হচ্ছে... ⏳"):
+                            st.session_state.rag_chain = load_rag_pipeline()
+                    with st.spinner("তথ্য খোঁজা হচ্ছে..."):
+                        try:
+                            answer = st.session_state.rag_chain.invoke({
+                                "input": combined,
+                                "chat_history": st.session_state.chat_history
+                            })
+                        except Exception as e:
+                            answer = f"❌ সমস্যা: {str(e)}"
+                        st.markdown(answer)
+                st.session_state.chat_history.extend([
+                    HumanMessage(content=combined), AIMessage(content=answer)
+                ])
+                st.session_state.messages.append({"role": "assistant", "content": answer})
 
-#             st.markdown(final_answer)
-
-#     st.session_state.chat_history.append(HumanMessage(content=combined_input))
-#     st.session_state.chat_history.append(AIMessage(content=final_answer))
-#     st.session_state.messages.append({"role": "assistant", "content": final_answer})
+        else:
+            combined = user_input
+            if st.session_state.get("ocr_confirmed_text"):
+                combined += f"\n\n[OCR]:\n{st.session_state.ocr_confirmed_text}"
+            vision = st.session_state.get("vision_extracted_symptoms")
+            if vision and not vision.startswith("ERROR"):
+                combined += f"\n\n[ছবির লক্ষণ]:\n{vision}"
+            with st.chat_message("assistant"):
+                if st.session_state.rag_chain is None:
+                    with st.spinner("প্রথমবার লোড হচ্ছে... ⏳" if is_bangla else "Loading... ⏳"):
+                        st.session_state.rag_chain = load_rag_pipeline()
+                with st.spinner("তথ্য খোঁজা হচ্ছে..." if is_bangla else "Searching..."):
+                    try:
+                        answer = st.session_state.rag_chain.invoke({
+                            "input": combined,
+                            "chat_history": st.session_state.chat_history
+                        })
+                    except Exception as e:
+                        answer = f"❌ সমস্যা হয়েছে: {str(e)}\n\nঅনুগ্রহ করে আবার চেষ্টা করুন।"
+                    st.markdown(answer)
+            st.session_state.chat_history.extend([
+                HumanMessage(content=combined), AIMessage(content=answer)
+            ])
+            st.session_state.messages.append({"role": "assistant", "content": answer})
