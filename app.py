@@ -1,14 +1,14 @@
 import os
 #import cv2
 import re
-#import numpy as np
+from groq import Groq
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain.chains import create_retrieval_chain, create_history_aware_retriever
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic.chains import create_retrieval_chain, create_history_aware_retriever
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 from PIL import Image
@@ -48,27 +48,7 @@ def analyze_symptoms_from_image(image):
 
 load_dotenv()
 groq_api_key = os.getenv("GROQ_API_KEY")
-
-# def get_voice_input():
-#     r = sr.Recognizer()
-#     with sr.Microphone() as source:
-#         st.info("🎤( Listening...)")
-#         # ব্যাকগ্রাউন্ড নয়েজ কমানোর জন্য
-#         r.adjust_for_ambient_noise(source) 
-#         try:
-#             audio = r.listen(source, timeout=5)
-#             # language="bn-BD" দিলে বাংলা বুঝবে, "en-US" দিলে ইংরেজি
-#             text = r.recognize_google(audio, language="bn-BD") 
-#             return text
-#         except sr.UnknownValueError:
-#             st.error("দুঃখিত, আমি কথাটি ঠিকমতো বুঝতে পারিনি।")
-#             return None
-#         except sr.RequestError:
-#             st.error("ইন্টারনেট কানেকশনে সমস্যা হচ্ছে!")
-#             return None
-#         except Exception as e:
-#             return None
-
+groq_client = Groq(api_key=groq_api_key)
 
 st.set_page_config(page_title="Personal Medical Assistant", page_icon="👩🏻‍⚕️")
 st.title("👩🏻‍⚕️ Personal Medical Assistant")
@@ -431,68 +411,22 @@ elif not uploaded_image:
         st.session_state.last_uploaded_file = None
 
 
-# ─── Chat Input (Voice + Text) ────────────────────────────────────────
-
-# chat_placeholder = (
-#     "আপনার লক্ষণ বা সমস্যার কথা লিখুন..."
-#     if is_bangla
-#     else "Type your symptoms or question..."
-# )
-
-# # ১. টেক্সট এবং ভয়েস ইনপুট ভেরিয়েবল সেট করা
-# text_input = st.chat_input(chat_placeholder)
-# voice_input = None
-
-# # ২. ভয়েস বাটন ক্লিক হলে অডিও থেকে টেক্সট নেওয়া
-# if st.button("🎤 কথা বলে প্রশ্ন করুন"):
-#     voice_input = get_voice_input()
-#     if voice_input:
-#         st.success(f"আপনি বলেছেন: {voice_input}")
-
-# # ৩. চূড়ান্ত ইনপুট: ইউজার টাইপ করুক বা কথা বলুক, যেকোনো একটি পেলেই কাজ করবে
-# user_input = text_input or voice_input
-
-# if user_input:
-#     # শুরুতে ইউজারের মূল প্রশ্নটি নিলাম
-#     combined_input = user_input
-
-#     # ১. OCR টেক্সট থাকলে সেটি যুক্ত করো
-#     if st.session_state.get("ocr_confirmed_text"):
-#         combined_input += (
-#             f"\n\n[OCR রিপোর্ট/প্রেসক্রিপশন থেকে পাওয়া তথ্য]:\n"
-#             f"{st.session_state.ocr_confirmed_text}"
-#         )
-
-#     # ২. Vision থেকে পাওয়া লক্ষণ থাকলে সেটিও যুক্ত করো (নতুন লজিক 🚀)
-#     vision_symptoms = st.session_state.get("vision_extracted_symptoms")
-#     if vision_symptoms and not vision_symptoms.startswith("ERROR"):
-#         combined_input += (
-#             f"\n\n[রোগীর আপলোড করা ছবির লক্ষণ]:\n"
-#             f"{vision_symptoms}"
-#         )
-
-#     # ইউজারের মেসেজ UI-তে দেখানো (ইউজার শুধু তার টাইপ করা অংশটুকুই দেখবে)
-#     with st.chat_message("user"):
-#         st.markdown(user_input)
-#     st.session_state.messages.append({"role": "user", "content": user_input})
-
-#     # এআই-এর উত্তর জেনারেট করা
-#     with st.chat_message("assistant"):
-#         with st.spinner("Processing..." if not is_bangla else "বই থেকে তথ্য খোঁজা হচ্ছে..."):
-#             response = rag_chain.invoke({
-#                 "input": combined_input, # এখন Groq ইউজারের প্রশ্ন + ছবি + OCR সবকিছু একসাথেই পাবে!
-#                 "chat_history": st.session_state.chat_history
-#             })
-#             answer = response["answer"]
-#             st.markdown(answer)
-
-#     # মেমোরি (History) আপডেট করা
-#     st.session_state.chat_history.append(HumanMessage(content=combined_input))
-#     st.session_state.chat_history.append(AIMessage(content=answer))
-#     st.session_state.messages.append({"role": "assistant", "content": answer})
-
 
 # ─── Chat Input (Text Only for Cloud) ────────────────────────────────────────
+
+
+LANGUAGE_CONFIG = {
+    "বাংলা": {
+        "voice_prompt": "এটি একটি চিকিৎসা সংক্রান্ত কথোপকথন।",
+        "spinner_msg": "ভয়েস প্রসেস করা হচ্ছে...",
+        "error_msg": "ভয়েস প্রসেসিং ব্যর্থ হয়েছে"
+    },
+    "English": {
+        "voice_prompt": "This is a medical conversation.",
+        "spinner_msg": "Processing voice...",
+        "error_msg": "Voice processing failed"
+    }
+}
 
 chat_placeholder = (
     "আপনার লক্ষণ বা সমস্যার কথা লিখুন..."
@@ -501,93 +435,73 @@ chat_placeholder = (
 )
 
 # ক্লাউডের জন্য শুধু টেক্সট ইনপুট নেওয়া হচ্ছে (ভয়েস বাটন বাদ দেওয়া হলো)
-user_input = st.chat_input(chat_placeholder)
+prompt = st.chat_input(chat_placeholder,accept_audio=True)
 
-if user_input:
-    # শুরুতে ইউজারের মূল প্রশ্নটি নিলাম
-    combined_input = user_input
+if prompt:
+    user_input = ""
 
-    # ১. OCR টেক্সট থাকলে সেটি যুক্ত করো
-    if st.session_state.get("ocr_confirmed_text"):
-        combined_input += (
-            f"\n\n[OCR রিপোর্ট/প্রেসক্রিপশন থেকে পাওয়া তথ্য]:\n"
-            f"{st.session_state.ocr_confirmed_text}"
-        )
+    if prompt.audio:
+        current_lang = LANGUAGE_CONFIG[st.session_state.ui_language]
+        with st.spinner(current_lang["spinner_msg"]):
+            try:
+                prompt.audio.name = "recording.wav"
+                
+                # Explicitly tell the model the language is Bengali
+                transcription = groq_client.audio.transcriptions.create(
+                    file=prompt.audio,
+                    model="whisper-large-v3",
+                    language="bn" if st.session_state.ui_language == "বাংলা" else "en",
+                    prompt=current_lang["voice_prompt"]
+                )
 
-    # ২. Vision থেকে পাওয়া লক্ষণ থাকলে সেটিও যুক্ত করো
-    vision_symptoms = st.session_state.get("vision_extracted_symptoms")
-    if vision_symptoms and not vision_symptoms.startswith("ERROR"):
-        combined_input += (
-            f"\n\n[রোগীর আপলোড করা ছবির লক্ষণ]:\n"
-            f"{vision_symptoms}"
-        )
+                # response = openai_client.audio.transcriptions.create(
+                #     file=prompt.audio,
+                #     model="whisper-1"
+                # )
+                user_input = transcription.text
+            except Exception as e:
+                st.error(f"Voice processing failed: {e}")
+    elif prompt.text:
+            user_input = prompt.text
+    
 
-    # ইউজারের মেসেজ UI-তে দেখানো (ইউজার শুধু তার টাইপ করা অংশটুকুই দেখবে)
-    with st.chat_message("user"):
-        st.markdown(user_input)
-    st.session_state.messages.append({"role": "user", "content": user_input})
+    if user_input:
+        # শুরুতে ইউজারের মূল প্রশ্নটি নিলাম
+        combined_input = user_input
 
-    # এআই-এর উত্তর জেনারেট করা
-    with st.chat_message("assistant"):
-        with st.spinner("Processing..." if not is_bangla else "বই থেকে তথ্য খোঁজা হচ্ছে..."):
-            response = rag_chain.invoke({
-                "input": combined_input, # এখন Groq ইউজারের প্রশ্ন + ছবি + OCR সবকিছু একসাথেই পাবে!
-                "chat_history": st.session_state.chat_history
-            })
-            answer = response["answer"]
-            st.markdown(answer)
+        # ১. OCR টেক্সট থাকলে সেটি যুক্ত করো
+        if st.session_state.get("ocr_confirmed_text"):
+            combined_input += (
+                f"\n\n[OCR রিপোর্ট/প্রেসক্রিপশন থেকে পাওয়া তথ্য]:\n"
+                f"{st.session_state.ocr_confirmed_text}"
+            )
 
-    # মেমোরি (History) আপডেট করা
-    st.session_state.chat_history.append(HumanMessage(content=combined_input))
-    st.session_state.chat_history.append(AIMessage(content=answer))
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        # ২. Vision থেকে পাওয়া লক্ষণ থাকলে সেটিও যুক্ত করো
+        vision_symptoms = st.session_state.get("vision_extracted_symptoms")
+        if vision_symptoms and not vision_symptoms.startswith("ERROR"):
+            combined_input += (
+                f"\n\n[রোগীর আপলোড করা ছবির লক্ষণ]:\n"
+                f"{vision_symptoms}"
+            )
+
+        # ইউজারের মেসেজ UI-তে দেখানো (ইউজার শুধু তার টাইপ করা অংশটুকুই দেখবে)
+        with st.chat_message("user"):
+            st.markdown(user_input)
+        st.session_state.messages.append({"role": "user", "content": user_input})
+
+        # এআই-এর উত্তর জেনারেট করা
+        with st.chat_message("assistant"):
+            with st.spinner("Processing..." if not is_bangla else "বই থেকে তথ্য খোঁজা হচ্ছে..."):
+                response = rag_chain.invoke({
+                    "input": combined_input, # এখন Groq ইউজারের প্রশ্ন + ছবি + OCR সবকিছু একসাথেই পাবে!
+                    "chat_history": st.session_state.chat_history
+                })
+                answer = response["answer"]
+                st.markdown(answer)
+
+        # মেমোরি (History) আপডেট করা
+        st.session_state.chat_history.append(HumanMessage(content=combined_input))
+        st.session_state.chat_history.append(AIMessage(content=answer))
+        st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
-
-# # ─── Chat Input ───────────────────────────────────────────────────────
-# # ভয়েস ইনপুট বাটন
-# if st.button("🎤 কথা বলে প্রশ্ন করুন"):
-#     voice_text = get_voice_input()
-#     if voice_text:
-#         st.success(f"আপনি বলেছেন: {voice_text}")
-#         # এই voice_text টি এখন তুমি তোমার মডেলের কাছে প্রম্পট হিসেবে পাঠিয়ে দিতে পারো!
-
-
-# chat_placeholder = (
-#     "আপনার লক্ষণ বা সমস্যার কথা লিখুন..."
-#     if is_bangla
-#     else "Type your symptoms or question..."
-# )
-# user_input = st.chat_input(chat_placeholder)
-
-# if user_input:
-
-#     if st.session_state.ocr_confirmed_text:
-#         combined_input = (
-#             f"{user_input}\n\n"
-#             f"[OCR থেকে পাওয়া তথ্য / Extracted from image]:\n"
-#             f"{st.session_state.ocr_confirmed_text}"
-#         )
-#     else:
-#         combined_input = user_input
-
-#     with st.chat_message("user"):
-#         st.markdown(user_input)
-#     st.session_state.messages.append({"role": "user", "content": user_input})
-
-#     with st.chat_message("assistant"):
-#         with st.spinner("Processing..."):
-#             response = rag_chain.invoke({
-#                 "input": combined_input,
-#                 "chat_history": st.session_state.chat_history
-#             })
-#             answer = response["answer"]
-
-#             disclaimer = "\n\n---\n*⚠️ সতর্কতা: I am a AI model, not a medical professional. Please consult a registered doctor for any medical concerns.*"
-#             final_answer = answer + disclaimer
-
-#             st.markdown(final_answer)
-
-#     st.session_state.chat_history.append(HumanMessage(content=combined_input))
-#     st.session_state.chat_history.append(AIMessage(content=final_answer))
-#     st.session_state.messages.append({"role": "assistant", "content": final_answer})
