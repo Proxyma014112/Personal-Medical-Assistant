@@ -103,6 +103,10 @@ for key, val in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
+if "app_initialized" not in st.session_state:
+    st.session_state.app_initialized = True
+    st.rerun()
+    
 is_bangla = st.session_state.ui_language == "বাংলা"
 
 
