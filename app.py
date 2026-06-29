@@ -28,7 +28,12 @@ gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
 if gemini_api_key:
     genai.configure(api_key=gemini_api_key)
 
-groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
+# FIX 2: Single cached client — no re-creation on every rerun
+@st.cache_resource
+def get_groq_client():
+    return Groq(api_key=groq_api_key) if groq_api_key else None
+
+groq_client = get_groq_client()
 
 
 # ─── Gemini Vision Functions ──────────────────────────────────────────
@@ -77,13 +82,14 @@ defaults = {
     "chat_history":             [],
     "ocr_confirmed_text":       None,
     "ocr_extracted_text":       None,
-    "ocr_edited_text":          None,   # tracks edits inside dialog
+    "ocr_edited_text":          None,
     "ui_language":              "বাংলা",
     "last_uploaded_file":       None,
     "vision_extracted_symptoms": None,
     "rag_chain":                None,
     "triage_active":            False,
     "triage_questions":         [],
+    "triage_questions_backup":  [],   # FIX 1: added to defaults
     "triage_original_input":    "",
     "triage_answers":           {},
     "triage_submit":            False,
@@ -137,9 +143,7 @@ specialist_types = [
 ]
 
 
-
 # ─── DIALOGS ──────────────────────────────────────────────────────────
-
 
 @st.dialog("⚙️ Settings", width="small")
 def dialog_settings():
@@ -151,7 +155,6 @@ def dialog_settings():
         st.session_state.ui_language = choice
         st.session_state.open_settings = False
         st.rerun()
-
 
 
 @st.dialog("📊 বিএমআই ও স্বাস্থ্য তথ্য" if is_bangla else "📊 BMI & Health Stats", width="small")
@@ -176,7 +179,6 @@ def dialog_bmi():
                 else "💡 Ask for a diet plan in the main chat!")
 
 
-# ── Vision dialog: no rerun inside, spinner on button ─────────────────
 @st.dialog("👁️ ভিজ্যুয়াল লক্ষণ পরীক্ষা" if is_bangla else "👁️ Visual Symptom Checker", width="medium")
 def dialog_vision():
     st.caption("লক্ষণ বুঝতে ছবি আপলোড করুন — Powered by Gemini Vision")
@@ -212,19 +214,16 @@ def dialog_vision():
             st.markdown("*ফলাফল এখানে দেখাবে*" if is_bangla else "*Results will appear here*")
 
 
-
 @st.dialog("📋 Prescription / Report OCR", width="medium")
 def dialog_ocr():
     st.caption("🔍 Gemini Vision দ্বারা পরিচালিত" if is_bangla else "🔍 Powered by Gemini Vision")
-    
-    # ── Step 1: Upload (only if no image stored yet) ──────────────────
+
     if st.session_state.ocr_image_bytes is None:
         uploaded = st.file_uploader(
             "প্রেসক্রিপশন / রিপোর্টের ছবি" if is_bangla else "Upload Prescription / Report",
             type=["jpg", "jpeg", "png"], key="ocr_uploader_dialog"
         )
         if uploaded:
-            # Persist bytes immediately so dialog survives reruns
             st.session_state.ocr_image_bytes = uploaded.read()
             st.session_state.ocr_image_name  = uploaded.name
             st.session_state.ocr_extracted_text = None
@@ -233,7 +232,6 @@ def dialog_ocr():
         else:
             return
 
-    # ── Step 2: Show image + Extract button ───────────────────────────
     from io import BytesIO
     img = Image.open(BytesIO(st.session_state.ocr_image_bytes))
 
@@ -269,7 +267,6 @@ def dialog_ocr():
                 st.session_state.last_uploaded_file = None
                 st.rerun()
 
-    # ── Step 3: Right column — edit + confirm ─────────────────────────
     with c_text:
         if st.session_state.ocr_confirmed_text:
             st.success("✅ নিশ্চিত করা হয়েছে — চ্যাটে এই তথ্য ব্যবহার হবে" if is_bangla
@@ -325,7 +322,6 @@ def dialog_hospital():
                 else "⚠️ MediAssist AI does not recommend any specific hospital.")
 
 
-
 @st.dialog("🚨 জরুরি হেল্পলাইন" if is_bangla else "🚨 Emergency Helplines", width="medium")
 def dialog_emergency():
     st.markdown("### 🇧🇩 বাংলাদেশ জরুরি হেল্পলাইন" if is_bangla else "### 🇧🇩 Bangladesh Emergency Helplines")
@@ -378,78 +374,77 @@ def dialog_emergency():
                else "⚠️ In an emergency, dial **999** directly.")
 
 
+# ─── SIDEBAR (wrapped in fragment for instant dialog opening) ──────────
+# FIX 3: @st.fragment means clicking a sidebar button only reruns this
+# block, not the entire page (chat history, RAG pipeline, etc.)
+@st.fragment
+def sidebar_and_dialogs():
+    st.markdown("## 👩🏻‍⚕️ MediAssist AI")
+    st.caption("আপনার ব্যক্তিগত স্বাস্থ্য সহকারী" if is_bangla else "Your personal health assistant")
+    st.markdown("---")
 
-# ─── SIDEBAR ──────────────────────────────────────────────────────────
+    st.markdown("**🛠️ টুলস**" if is_bangla else "**🛠️ Tools**")
+    if st.button("⚙️ সেটিংস" if is_bangla else "⚙️ Settings", use_container_width=True):
+        st.session_state.open_settings = True
+    if st.button("📊 বিএমআই ও স্বাস্থ্য ড্যাশবোর্ড" if is_bangla else "📊 BMI & Health Dashboard",
+                        use_container_width=True):
+        st.session_state.open_bmi = True
+    if st.button("👁️ ভিজ্যুয়াল লক্ষণ পরীক্ষা" if is_bangla else "👁️ Visual Symptom Checker",
+                        use_container_width=True):
+        st.session_state.open_vision = True
+    if st.button("📄 প্রেসক্রিপশন OCR" if is_bangla else "📄 Prescription OCR", use_container_width=True):
+        st.session_state.open_ocr = True
+    if st.button("🏥 হাসপাতাল ফাইন্ডার" if is_bangla else "🏥 Hospital Finder", use_container_width=True):
+        st.session_state.open_hospital = True
 
-st.sidebar.markdown("## 👩🏻‍⚕️ MediAssist AI")
-st.sidebar.caption("আপনার ব্যক্তিগত স্বাস্থ্য সহকারী" if is_bangla else "Your personal health assistant")
-st.sidebar.markdown("---")
+    st.markdown("---")
+    if st.button("🚨 জরুরি হেল্পলাইন" if is_bangla else "🚨 Emergency Helplines",
+                        use_container_width=True, type="primary"):
+        st.session_state.open_emergency = True
 
-st.sidebar.markdown("**🛠️ টুলস**" if is_bangla else "**🛠️ Tools**")
-if st.sidebar.button("⚙️ সেটিংস" if is_bangla else "⚙️ Settings", use_container_width=True):
-    st.session_state.open_settings = True
-if st.sidebar.button("📊 বিএমআই ও স্বাস্থ্য ড্যাশবোর্ড" if is_bangla else "📊 BMI & Health Dashboard",
-                      use_container_width=True):
-    st.session_state.open_bmi = True
-if st.sidebar.button("👁️ ভিজ্যুয়াল লক্ষণ পরীক্ষা" if is_bangla else "👁️ Visual Symptom Checker",
-                      use_container_width=True):
-    st.session_state.open_vision = True
-if st.sidebar.button("📄 প্রেসক্রিপশন OCR" if is_bangla else "📄 Prescription OCR", use_container_width=True):
-    st.session_state.open_ocr = True
-if st.sidebar.button("🏥 হাসপাতাল ফাইন্ডার" if is_bangla else "🏥 Hospital Finder", use_container_width=True):
-    st.session_state.open_hospital = True
+    st.markdown("🆘 **জরুরি অবস্থায় `999` ডায়াল করুন**" if is_bangla
+                         else "🆘 **In an emergency, dial `999`**")
 
-st.sidebar.markdown("---")
-if st.sidebar.button("🚨 জরুরি হেল্পলাইন" if is_bangla else "🚨 Emergency Helplines",
-                      use_container_width=True, type="primary"):
-    st.session_state.open_emergency = True
+    # ─── Open dialogs ─────────────────────────────────────────────────
+    if st.session_state.open_settings:
+        st.session_state.open_settings = False
+        dialog_settings()
 
-st.sidebar.markdown("🆘 **জরুরি অবস্থায় `999` ডায়াল করুন**" if is_bangla
-                     else "🆘 **In an emergency, dial `999`**")
+    if st.session_state.open_bmi:
+        st.session_state.open_bmi = False
+        dialog_bmi()
 
+    if st.session_state.open_vision:
+        st.session_state.open_vision = False
+        dialog_vision()
 
+    if st.session_state.open_ocr:
+        st.session_state.open_ocr = False
+        dialog_ocr()
 
-# Status badges — compact, no box
+    if st.session_state.open_hospital:
+        st.session_state.open_hospital = False
+        dialog_hospital()
 
+    if st.session_state.open_emergency:
+        st.session_state.open_emergency = False
+        dialog_emergency()
 
-# ─── Open dialogs ─────────────────────────────────────────────────────
-if st.session_state.open_settings:
-    st.session_state.open_settings = False
-    dialog_settings()
-
-if st.session_state.open_bmi:
-    st.session_state.open_bmi = False
-    dialog_bmi()
-
-if st.session_state.open_vision:
-    st.session_state.open_vision = False
-    dialog_vision()
-
-if st.session_state.open_ocr:
-    st.session_state.open_ocr = False
-    dialog_ocr()
-
-if st.session_state.open_hospital:
-    st.session_state.open_hospital = False
-    dialog_hospital()
-
-if st.session_state.open_emergency:
-    st.session_state.open_emergency = False
-    dialog_emergency()
+with st.sidebar:
+    sidebar_and_dialogs()
 
 
-#Main Area
-
+# ─── Main Area ────────────────────────────────────────────────────────
 st.title("👩🏻‍⚕️ MediAssist AI")
-st.caption("আপনার স্বাস্থ্য বিষয়ক যেকোনো প্রশ্ন করুন" if is_bangla 
-        else "Ask any question related to your health, for better try adding prescription, photo of symptop from sidebar")
+st.caption("আপনার স্বাস্থ্য বিষয়ক যেকোনো প্রশ্ন করুন" if is_bangla
+        else "Ask any question related to your health, for better try adding prescription, photo of symptom from sidebar")
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
 
-# ─── RAG Pipeline ────────────────────────────────────────────────────
+# ─── RAG Pipeline ─────────────────────────────────────────────────────
 @st.cache_resource
 def load_rag_pipeline():
     embeddings = HuggingFaceEmbeddings(
@@ -495,7 +490,7 @@ def load_rag_pipeline():
 
         "### CORE RULES ###\n"
         "- ONLY use information from the provided context.\n"
-        "- If context lacks infoa and you are unsure, then tell him to seek help from doctor.\n"
+        "- If context lacks info and you are unsure, then tell him to seek help from doctor.\n"
         "- NEVER invent medical information, drug names, or dosages.\n"
         "- NEVER provide a specific diagnosis.\n\n"
         "- If you do not know anything for the context then no need to invent any info from llm "
@@ -526,7 +521,7 @@ def load_rag_pipeline():
     )
 
 
-# ─── Voice Config ─────────────────────────────────────────────────────
+# ─── Voice Config ──────────────────────────────────────────────────────
 LANGUAGE_CONFIG = {
     "বাংলা":   {"voice_prompt": "এটি একটি চিকিৎসা সংক্রান্ত কথোপকথন।",
                  "spinner_msg": "ভয়েস প্রসেস করা হচ্ছে...",
@@ -537,7 +532,7 @@ LANGUAGE_CONFIG = {
 }
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────
 def _run_rag(enriched_input: str) -> str:
     if st.session_state.rag_chain is None:
         with st.spinner("লোড হচ্ছে... ⏳"):
@@ -583,10 +578,10 @@ def is_symptom_query(text: str) -> bool:
     return any(k in text.lower() for k in kws)
 
 
+# FIX 2: Removed duplicate `client = Groq(...)` and reuses cached groq_client
 def generate_triage_questions(symptom_text: str) -> list:
     try:
         import json
-        client = Groq(api_key=groq_api_key)
         prompt = f"""Patient said: "{symptom_text}"
 
 STRICT RULE:
@@ -598,7 +593,7 @@ Generate 3-5 MCQ questions (exactly 4 options each) to understand the condition.
 Return ONLY valid JSON, no markdown, no preamble.
 Format: {{"questions":[{{"id":1,"question":"...","options":["A","B","C","D"]}}]}}"""
 
-        raw = Groq(api_key=groq_api_key).chat.completions.create(
+        raw = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3, max_tokens=1000,
@@ -614,7 +609,7 @@ Format: {{"questions":[{{"id":1,"question":"...","options":["A","B","C","D"]}}]}
 
 
 # ─── Triage Dialog ────────────────────────────────────────────────────
-@st.dialog("🩺 লক্ষণ মূল্যায়ন" if is_bangla else "🩺 Symptoms Evaluation ", width="medium")
+@st.dialog("🩺 লক্ষণ মূল্যায়ন" if is_bangla else "🩺 Symptoms Evaluation", width="medium")
 def triage_dialog():
     st.caption("সব প্রশ্নের উত্তর দিন তারপর submit করুন" if is_bangla
             else "Please answer all questions and then submit")
@@ -664,6 +659,7 @@ if st.session_state.get("triage_submit") or st.session_state.get("triage_skip"):
     enriched = st.session_state.triage_original_input
     if submitted and st.session_state.triage_answers:
         enriched += "\n\n[Patient answers]:\n"
+        # FIX 1: triage_questions_backup is now properly set, so this loop actually runs
         for q in (st.session_state.get("triage_questions_backup") or []):
             ans = st.session_state.triage_answers.get(str(q["id"]), "N/A")
             enriched += f"- {q['question']}: {ans}\n"
@@ -689,7 +685,7 @@ else:
         if is_bangla else
         "Type your symptoms or question, or use the microphone..."
     )
-    prompt = st.chat_input(placeholder, accept_audio=True,key="main_chat_input")
+    prompt = st.chat_input(placeholder, accept_audio=True, key="main_chat_input")
 
     if prompt:
         user_input = ""
@@ -721,10 +717,11 @@ else:
                                 else "🩺 Analyzing symptoms..."):
                     questions = generate_triage_questions(user_input)
                 if questions:
-                    st.session_state.triage_active         = True
-                    st.session_state.triage_questions      = questions
-                    st.session_state.triage_original_input = user_input
-                    st.session_state.triage_answers        = {}
+                    st.session_state.triage_active           = True
+                    st.session_state.triage_questions        = questions
+                    st.session_state.triage_questions_backup = questions   # FIX 1: save backup
+                    st.session_state.triage_original_input   = user_input
+                    st.session_state.triage_answers          = {}
                     st.session_state.messages.append({"role": "user", "content": user_input})
                     st.rerun()
                 else:
@@ -739,7 +736,3 @@ else:
                         answer = _run_rag(combined)
                     st.markdown(answer)
                 _save_to_history(user_input, combined, answer)
-
-
-
-
