@@ -106,7 +106,7 @@ for key, val in defaults.items():
 if "app_initialized" not in st.session_state:
     st.session_state.app_initialized = True
     st.rerun()
-    
+
 is_bangla = st.session_state.ui_language == "বাংলা"
 
 
@@ -739,3 +739,36 @@ else:
                         answer = _run_rag(combined)
                     st.markdown(answer)
                 _save_to_history(user_input, combined, answer)
+
+
+
+import streamlit.components.v1 as components
+
+# After your session state block, before chat messages
+components.html("""
+<script>
+    // Wait for Streamlit to fully load then trigger a dummy interaction
+    function forceRender() {
+        const interval = setInterval(() => {
+            const chatInput = document.querySelector('[data-testid="stChatInput"]');
+            if (chatInput) {
+                const input = chatInput.querySelector('textarea');
+                if (input) {
+                    // Simulate focus and immediate blur — triggers rerender
+                    input.focus();
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.blur();
+                    clearInterval(interval);
+                }
+            }
+        }, 300);
+        setTimeout(() => clearInterval(interval), 5000); // stop trying after 5s
+    }
+
+    if (document.readyState === 'complete') {
+        forceRender();
+    } else {
+        window.addEventListener('load', forceRender);
+    }
+</script>
+""", height=0)
