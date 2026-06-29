@@ -8,3 +8,8 @@ langchain-community
 langchain-huggingface
 python-dotenv
 pillow
+langchain-huggingface
+sentence-transformers
+huggingface-hub
+torch
+dotenv
