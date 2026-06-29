@@ -685,7 +685,7 @@ else:
         if is_bangla else
         "Type your symptoms or question, or use the microphone..."
     )
-    prompt = st.chat_input(placeholder, accept_audio=True)
+    prompt = st.chat_input(placeholder, accept_audio=True,key=st.session_state.input_key)
 
     if prompt:
         user_input = ""
