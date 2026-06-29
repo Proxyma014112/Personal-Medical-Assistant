@@ -2,8 +2,8 @@ import os
 from groq import Groq
 import streamlit as st
 from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+#from langchain_huggingface import HuggingFaceEmbeddings
+#from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
@@ -372,9 +372,7 @@ def dialog_emergency():
                else "⚠️ In an emergency, dial **999** directly.")
 
 
-# ─── SIDEBAR (wrapped in fragment for instant dialog opening) ──────────
-# FIX 3: @st.fragment means clicking a sidebar button only reruns this
-# block, not the entire page (chat history, RAG pipeline, etc.)
+
 # ─── SIDEBAR ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 👩🏻‍⚕️ MediAssist AI")
@@ -446,6 +444,8 @@ for message in st.session_state.messages:
 # ─── RAG Pipeline ─────────────────────────────────────────────────────
 @st.cache_resource
 def load_rag_pipeline():
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_community.vectorstores import Chroma
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     )
@@ -577,7 +577,7 @@ def is_symptom_query(text: str) -> bool:
     return any(k in text.lower() for k in kws)
 
 
-# FIX 2: Removed duplicate `client = Groq(...)` and reuses cached groq_client
+
 def generate_triage_questions(symptom_text: str) -> list:
     try:
         import json
