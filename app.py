@@ -1,54 +1,96 @@
-import os
-from groq import Groq
-import streamlit as st
-from langchain_groq import ChatGroq
-#from langchain_huggingface import HuggingFaceEmbeddings
-#from langchain_community.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from PIL import Image
-import google.generativeai as genai
-from dotenv import load_dotenv
-import logging
+"""
+MediAssist AI — performance-optimized version.
 
+Changes vs. the original app.py, and why:
+
+  1. st.fragment scoping (sidebar_tools, chat_panel)
+     Opening a sidebar dialog, or answering one triage question, used to
+     rerun the ENTIRE script — including re-rendering the full chat
+     history and touching the RAG pipeline checks. Now each of those
+     interactions only reruns its own fragment.
+
+  2. Consolidated session_state
+     The dozen loose flags (triage_active, triage_questions,
+     triage_questions_backup, triage_submit, triage_skip, ocr_*, the
+     dead open_* dialog flags, last_uploaded_file, rag_chain) are
+     replaced with two small dicts: st.session_state.triage and
+     st.session_state.ocr, plus one transient "pending_chat_job" key.
+     The triage flow now needs exactly ONE full rerun (to close the
+     dialog) instead of two, and there's no more *_backup duplication.
+
+  3. OCR images on disk, not in session_state
+     Raw image bytes used to live in session_state.ocr_image_bytes for
+     the whole session (can be several MB, held in server RAM). Now
+     only a small temp-file path string is kept in session_state.
+
+  4. Lazy imports for heavy/ML dependencies
+     google-generativeai and the torch-backed HuggingFace embeddings /
+     Chroma / langchain stack are now imported inside the functions
+     that actually use them, not at module import time. This keeps the
+     app's baseline memory footprint (and cold-start time) much lower —
+     which matters a lot on a memory-capped host like Streamlit
+     Community Cloud's free tier.
+
+  5. Capped chat rendering
+     Only the last MAX_VISIBLE_MESSAGES are re-rendered each rerun.
+     Full history is still kept in session_state for RAG context.
+"""
+
+import os
+import logging
+import pathlib
+import tempfile
+import uuid
+
+import streamlit as st
+from PIL import Image
+from groq import Groq
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, AIMessage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("mediassist")
+
 # ─── Environment Setup ────────────────────────────────────────────────
 try:
     load_dotenv()
 except Exception:
     pass
 
-groq_api_key   = os.environ.get("GROQ_API_KEY", "")
+groq_api_key = os.environ.get("GROQ_API_KEY", "")
 gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
 
-if gemini_api_key:
-    genai.configure(api_key=gemini_api_key)
+MAX_VISIBLE_MESSAGES = 30  # PERF: cap per-rerun chat render cost
 
-# FIX 2: Single cached client — no re-creation on every rerun
+
 @st.cache_resource
 def get_groq_client():
     return Groq(api_key=groq_api_key) if groq_api_key else None
 
+
 groq_client = get_groq_client()
 
 
-# ─── Gemini Vision Functions ──────────────────────────────────────────
-def analyze_symptoms_from_image(image):
+# ─── Gemini Vision Functions (lazy import) ────────────────────────────
+def _gemini_model(model_name: str = "gemini-2.5-flash"):
+    """Import + configure google-generativeai only when actually needed."""
+    import google.generativeai as genai
+    genai.configure(api_key=gemini_api_key)
+    return genai.GenerativeModel(model_name)
+
+
+def analyze_symptoms_from_image(image, bangla: bool):
     if not gemini_api_key:
         return "ERROR: Gemini API key পাওয়া যায়নি।"
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = _gemini_model()
         prompt = f"""You are an expert clinical observer. Look at this medical image and accurately
         describe the visible symptoms in 2-3 short sentences.
         DO NOT provide a diagnosis or medical advice.
-        Just describe what you see physically. Reply in {'Bengali' if is_bangla else 'English'}."""
+        Just describe what you see physically. Reply in {'Bengali' if bangla else 'English'}."""
         response = model.generate_content([prompt, image])
         return response.text
-    except Exception as e:
+    except Exception:
         logger.exception("Gemini vision analysis failed")
         return "ERROR: ছবি প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।"
 
@@ -57,18 +99,18 @@ def extract_text_gemini(image):
     if not gemini_api_key:
         return "ERROR: Gemini API key পাওয়া যায়নি।"
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = _gemini_model()
         prompt = """You are an expert pharmacist. Read this medical prescription or lab report carefully.
         Extract: medicine names, dosages, duration, and any medical advice.
         Format the extracted text neatly. Do not give medical advice."""
         response = model.generate_content([prompt, image])
         return response.text.strip()
-    except Exception as e:
+    except Exception:
         logger.exception("Gemini OCR extraction failed")
         return "ERROR: Gemini OCR ব্যর্থ হয়েছে। আবার চেষ্টা করুন।"
 
 
-# ─── Page Config ──────────────────────────────────────────────────────
+# ─── Page Config (must be the first Streamlit UI call) ───────────────
 st.set_page_config(page_title="MediAssist AI", page_icon="👩🏻‍⚕️", layout="wide")
 
 if not groq_api_key:
@@ -78,39 +120,49 @@ if not groq_api_key:
 
 # ─── Session State Init ───────────────────────────────────────────────
 defaults = {
-    "messages":                 [],
-    "chat_history":             [],
-    "ocr_confirmed_text":       None,
-    "ocr_extracted_text":       None,
-    "ocr_edited_text":          None,
-    "ui_language":              "বাংলা",
-    "last_uploaded_file":       None,
+    "messages": [],
+    "chat_history": [],
+    "ui_language": "বাংলা",
     "vision_extracted_symptoms": None,
-    "rag_chain":                None,
-    "triage_active":            False,
-    "triage_questions":         [],
-    "triage_questions_backup":  [],   # FIX 1: added to defaults
-    "triage_original_input":    "",
-    "triage_answers":           {},
-    "triage_submit":            False,
-    "triage_skip":              False,
-    # dialog open flags
-    "open_settings":            False,
-    "open_bmi":                 False,
-    "open_vision":              False,
-    "open_ocr":                 False,
-    "open_hospital":            False,
-    "open_emergency":           False,
-    # OCR image bytes — persists across reruns unlike file_uploader
-    "ocr_image_bytes":          None,
-    "ocr_image_name":           None,
+    "pending_chat_job": None,  # work queued by the triage dialog, consumed once
+    # consolidated OCR dialog state (was 5 separate keys, including raw image bytes)
+    "ocr": {
+        "image_path": None,
+        "image_name": None,
+        "extracted_text": None,
+        "confirmed_text": None,
+    },
+    # consolidated triage state (was 7 separate keys incl. a _backup duplicate)
+    "triage": {
+        "active": False,
+        "questions": [],
+        "original_input": "",
+        "answers": {},
+    },
 }
 for key, val in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-
 is_bangla = st.session_state.ui_language == "বাংলা"
+
+
+# ─── Temp-file helpers for OCR images (replaces raw bytes in session_state) ──
+def _save_temp_image(uploaded_file) -> str:
+    suffix = pathlib.Path(uploaded_file.name).suffix or ".png"
+    tmp_dir = pathlib.Path(tempfile.gettempdir()) / "mediassist_uploads"
+    tmp_dir.mkdir(exist_ok=True)
+    path = tmp_dir / f"{uuid.uuid4().hex}{suffix}"
+    path.write_bytes(uploaded_file.getvalue())
+    return str(path)
+
+
+def _clear_temp_image(path) -> None:
+    if path:
+        try:
+            pathlib.Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ─── Static Data ──────────────────────────────────────────────────────
@@ -150,19 +202,18 @@ def dialog_settings():
     )
     if st.button("✅ Save & Close", type="primary", use_container_width=True):
         st.session_state.ui_language = choice
-        st.session_state.open_settings = False
-        st.rerun()
+        st.rerun()  # full app rerun: language affects almost every label on the page
 
 
 @st.dialog("📊 বিএমআই ও স্বাস্থ্য তথ্য" if is_bangla else "📊 BMI & Health Stats", width="small")
 def dialog_bmi():
     st.caption("আপনার স্বাস্থ্য তথ্য দিন" if is_bangla else "Enter your health info")
-    weight    = st.number_input("ওজন (kg)" if is_bangla else "Weight (kg)",
-    min_value=10.0, max_value=200.0, value=70.0,  step=0.5)
+    weight = st.number_input("ওজন (kg)" if is_bangla else "Weight (kg)",
+        min_value=10.0, max_value=200.0, value=70.0, step=0.5)
     height_cm = st.number_input("উচ্চতা (cm)" if is_bangla else "Height (cm)",
-    min_value=50.0, max_value=250.0, value=170.0, step=1.0)
+        min_value=50.0, max_value=250.0, value=170.0, step=1.0)
     if st.button("📊 হিসাব করুন" if is_bangla else "📊 Calculate", type="primary", use_container_width=True):
-        bmi          = weight / ((height_cm / 100) ** 2)
+        bmi = weight / ((height_cm / 100) ** 2)
         water_intake = (weight * 35) / 1000
         st.divider()
         c1, c2 = st.columns(2)
@@ -195,7 +246,7 @@ def dialog_vision():
                             type="primary", use_container_width=True)
         if analyze:
             with st.spinner("বিশ্লেষণ করা হচ্ছে..."):
-                result = analyze_symptoms_from_image(img)
+                result = analyze_symptoms_from_image(img, is_bangla)
             st.session_state.vision_extracted_symptoms = result
 
     with c_res:
@@ -214,81 +265,83 @@ def dialog_vision():
 @st.dialog("📋 Prescription / Report OCR", width="medium")
 def dialog_ocr():
     st.caption("🔍 Gemini Vision দ্বারা পরিচালিত" if is_bangla else "🔍 Powered by Gemini Vision")
+    ocr = st.session_state.ocr
 
-    if st.session_state.ocr_image_bytes is None:
+    if ocr["image_path"] is None:
         uploaded = st.file_uploader(
             "প্রেসক্রিপশন / রিপোর্টের ছবি" if is_bangla else "Upload Prescription / Report",
             type=["jpg", "jpeg", "png"], key="ocr_uploader_dialog"
         )
         if uploaded:
-            st.session_state.ocr_image_bytes = uploaded.getvalue()
-            st.session_state.ocr_image_name  = uploaded.name
-            st.session_state.ocr_extracted_text = None
-            st.session_state.ocr_confirmed_text = None
-            st.session_state.ocr_edited_text    = None
+            ocr["image_path"] = _save_temp_image(uploaded)
+            ocr["image_name"] = uploaded.name
+            ocr["extracted_text"] = None
+            ocr["confirmed_text"] = None
             st.rerun()
         else:
             return
 
-    from io import BytesIO
-    img = Image.open(BytesIO(st.session_state.ocr_image_bytes))
+    try:
+        img = Image.open(ocr["image_path"])
+    except Exception:
+        # temp file gone (e.g. ephemeral storage on a redeployed/cloud container)
+        st.warning("⚠️ ছবিটি আর পাওয়া যাচ্ছে না, আবার আপলোড করুন।" if is_bangla
+                   else "⚠️ Image no longer available, please re-upload.")
+        st.session_state.ocr = {"image_path": None, "image_name": None,
+                                  "extracted_text": None, "confirmed_text": None}
+        st.rerun()
+        return
 
     c_img, c_text = st.columns([1, 1], gap="medium")
 
     with c_img:
-        st.image(img, caption=st.session_state.ocr_image_name, use_container_width=True)
+        st.image(img, caption=ocr["image_name"], use_container_width=True)
 
-        if st.session_state.ocr_extracted_text is None:
+        if ocr["extracted_text"] is None:
             if st.button("🔍 টেক্সট বের করুন" if is_bangla else "🔍 Extract Text",
                 type="primary", use_container_width=True):
                 with st.spinner("🔍 OCR হচ্ছে..." if is_bangla else "🔍 Extracting..."):
                     result = extract_text_gemini(img)
-                st.session_state.ocr_extracted_text = result
-                st.session_state.ocr_edited_text    = result
+                ocr["extracted_text"] = result
 
         col_r, col_x = st.columns(2)
         with col_r:
             reextract_label = "🔄 পুনরায় বের করুন" if is_bangla else "🔄 Re-extract"
-            if st.session_state.ocr_extracted_text and st.button(reextract_label, use_container_width=True):
+            if ocr["extracted_text"] and st.button(reextract_label, use_container_width=True):
                 with st.spinner("🔍 Re-extracting..."):
                     result = extract_text_gemini(img)
-                st.session_state.ocr_extracted_text = result
-                st.session_state.ocr_edited_text    = result
-                st.session_state.ocr_confirmed_text = None
+                ocr["extracted_text"] = result
+                ocr["confirmed_text"] = None
         with col_x:
             if st.button("🗑️ ছবি মুছুন" if is_bangla else "🗑️ Clear Image", use_container_width=True):
-                st.session_state.ocr_image_bytes    = None
-                st.session_state.ocr_image_name     = None
-                st.session_state.ocr_extracted_text = None
-                st.session_state.ocr_confirmed_text = None
-                st.session_state.ocr_edited_text    = None
-                st.session_state.last_uploaded_file = None
+                _clear_temp_image(ocr["image_path"])
+                st.session_state.ocr = {"image_path": None, "image_name": None,
+                                          "extracted_text": None, "confirmed_text": None}
                 st.rerun()
 
     with c_text:
-        if st.session_state.ocr_confirmed_text:
+        if ocr["confirmed_text"]:
             st.success("✅ নিশ্চিত করা হয়েছে — চ্যাটে এই তথ্য ব্যবহার হবে" if is_bangla
                     else "✅ Confirmed — this will be used as context in chat")
-            st.markdown(st.session_state.ocr_confirmed_text)
+            st.markdown(ocr["confirmed_text"])
             if st.button("✏️ আবার সম্পাদনা করুন" if is_bangla else "✏️ Edit Again", use_container_width=True):
-                st.session_state.ocr_confirmed_text = None
+                ocr["confirmed_text"] = None
 
-        elif st.session_state.ocr_extracted_text:
-            if st.session_state.ocr_extracted_text.startswith("ERROR"):
-                st.error(st.session_state.ocr_extracted_text)
+        elif ocr["extracted_text"]:
+            if ocr["extracted_text"].startswith("ERROR"):
+                st.error(ocr["extracted_text"])
             else:
                 st.markdown("**✏️ প্রয়োজনে সম্পাদনা করুন:**" if is_bangla else "**✏️ Edit if needed:**")
                 edited = st.text_area(
                     "ocr_edit_area",
-                    value=st.session_state.ocr_extracted_text,
+                    value=ocr["extracted_text"],
                     height=250,
                     label_visibility="collapsed",
                     key="ocr_text_area_live"
                 )
                 confirm_label = "✅ নিশ্চিত করুন ও চ্যাটে ব্যবহার করুন" if is_bangla else "✅ Confirm & Use in Chat"
                 if st.button(confirm_label, type="primary", use_container_width=True):
-                    st.session_state.ocr_confirmed_text = edited
-                    st.session_state.ocr_edited_text    = edited
+                    ocr["confirmed_text"] = edited
         else:
             st.markdown(
                 "*ছবি থেকে text extract হলে এখানে দেখাবে*" if is_bangla
@@ -309,7 +362,7 @@ def dialog_hospital():
             "কী ধরনের সাহায্য?" if is_bangla else "Type of help?", specialist_types)
 
     if st.button("🔍 খুঁজুন" if is_bangla else "🔍 Search", type="primary", use_container_width=True):
-        spec_en  = specialist.split("(")[-1].replace(")", "").strip()
+        spec_en = specialist.split("(")[-1].replace(")", "").strip()
         maps_url = f"https://www.google.com/maps/search/{spec_en}+hospital+near+{district}+Bangladesh".replace(" ", "+")
         st.success(f"**{district}** — {specialist}")
         st.markdown(f"### 🗺️ [Google Maps এ দেখুন →]({maps_url})")
@@ -372,28 +425,69 @@ def dialog_emergency():
                else "⚠️ In an emergency, dial **999** directly.")
 
 
+@st.dialog("🩺 লক্ষণ মূল্যায়ন" if is_bangla else "🩺 Symptoms Evaluation", width="medium")
+def triage_dialog():
+    st.caption("সব প্রশ্নের উত্তর দিন তারপর submit করুন" if is_bangla
+            else "Please answer all questions and then submit")
+    t = st.session_state.triage
+    questions = t["questions"]
 
-# ─── SIDEBAR ──────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 👩🏻‍⚕️ MediAssist AI")
-    st.caption("আপনার ব্যক্তিগত স্বাস্থ্য সহকারী" if is_bangla else "Your personal health assistant")
-    st.markdown("---")
+    cols = st.columns(2)
+    for i, q in enumerate(questions):
+        with cols[i % 2]:
+            with st.container(border=True):
+                st.caption(f"প্রশ্ন {i+1}" if is_bangla else f"Question {i+1}")
+                st.markdown(f"**{q['question']}**")
+                val = st.radio(q["question"], q["options"],
+                            key=f"dq_{q['id']}", index=None, label_visibility="hidden")
+                if val:
+                    t["answers"][str(q["id"])] = val
 
+    answered = len(t["answers"])
+    total = len(questions)
+    st.progress(answered / total if total else 0)
+    st.caption(f"✅ {answered} / {total} answered")
+
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if st.button("⏭️ Skip", use_container_width=True):
+            _finish_triage(submitted=False)
+    with c2:
+        if st.button("✅ Submit", type="primary", use_container_width=True, disabled=answered < total):
+            _finish_triage(submitted=True)
+
+
+def _finish_triage(submitted: bool) -> None:
+    """Close the triage dialog and hand the result to the chat panel as ONE
+    queued job, processed on the very next rerun. (The original flow needed
+    two full reruns here; this needs one.)"""
+    t = st.session_state.triage
+    st.session_state.pending_chat_job = {
+        "raw": t["original_input"],
+        "answers": dict(t["answers"]) if submitted else None,
+        "questions": list(t["questions"]),
+    }
+    st.session_state.triage = {"active": False, "questions": [], "original_input": "", "answers": {}}
+    st.rerun()  # full rerun: this is what actually closes the open st.dialog
+
+
+# ─── SIDEBAR (fragment-scoped: opening a dialog no longer reruns the chat) ──
+@st.fragment
+def sidebar_tools():
     st.markdown("**🛠️ টুলস**" if is_bangla else "**🛠️ Tools**")
-    
-    # Launching dialogs immediately on click prevents fragment delays
+
     if st.button("⚙️ সেটিংস" if is_bangla else "⚙️ Settings", use_container_width=True):
         dialog_settings()
-        
+
     if st.button("📊 বিএমআই ও স্বাস্থ্য ড্যাশবোর্ড" if is_bangla else "📊 BMI & Health Dashboard", use_container_width=True):
         dialog_bmi()
-        
+
     if st.button("👁️ ভিজ্যুয়াল লক্ষণ পরীক্ষা" if is_bangla else "👁️ Visual Symptom Checker", use_container_width=True):
         dialog_vision()
-        
+
     if st.button("📄 প্রেসক্রিপশন OCR" if is_bangla else "📄 Prescription OCR", use_container_width=True):
         dialog_ocr()
-        
+
     if st.button("🏥 হাসপাতাল ফাইন্ডার" if is_bangla else "🏥 Hospital Finder", use_container_width=True):
         dialog_hospital()
 
@@ -401,51 +495,35 @@ with st.sidebar:
     if st.button("🚨 জরুরি হেল্পলাইন" if is_bangla else "🚨 Emergency Helplines", use_container_width=True, type="primary"):
         dialog_emergency()
 
+
+with st.sidebar:
+    st.markdown("## 👩🏻‍⚕️ MediAssist AI")
+    st.caption("আপনার ব্যক্তিগত স্বাস্থ্য সহকারী" if is_bangla else "Your personal health assistant")
+    st.markdown("---")
+    sidebar_tools()
     st.markdown("🆘 **জরুরি অবস্থায় `999` ডায়াল করুন**" if is_bangla else "🆘 **In an emergency, dial `999`**")
 
-    # ─── Open dialogs ─────────────────────────────────────────────────
-    if st.session_state.open_settings:
-        st.session_state.open_settings = False
-        dialog_settings()
 
-    if st.session_state.open_bmi:
-        st.session_state.open_bmi = False
-        dialog_bmi()
-
-    if st.session_state.open_vision:
-        st.session_state.open_vision = False
-        dialog_vision()
-
-    if st.session_state.open_ocr:
-        st.session_state.open_ocr = False
-        dialog_ocr()
-
-    if st.session_state.open_hospital:
-        st.session_state.open_hospital = False
-        dialog_hospital()
-
-    if st.session_state.open_emergency:
-        st.session_state.open_emergency = False
-        dialog_emergency()
-
-
-
-
-# ─── Main Area ────────────────────────────────────────────────────────
+# ─── Main Area Header ─────────────────────────────────────────────────
 st.title("👩🏻‍⚕️ MediAssist AI")
 st.caption("আপনার স্বাস্থ্য বিষয়ক যেকোনো প্রশ্ন করুন" if is_bangla
         else "Ask any question related to your health, for better try adding prescription, photo of symptom from sidebar")
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
 
-
-# ─── RAG Pipeline ─────────────────────────────────────────────────────
+# ─── RAG Pipeline (heavy deps imported lazily, result cached by Streamlit) ──
 @st.cache_resource
 def load_rag_pipeline():
+    # PERF: torch/sentence-transformers/Chroma/langchain are only imported
+    # the first time a chat message actually needs the RAG chain, not at
+    # app startup. st.cache_resource then keeps this built chain around for
+    # the whole process (shared across sessions), so this cost is paid once.
     from langchain_huggingface import HuggingFaceEmbeddings
     from langchain_community.vectorstores import Chroma
+    from langchain_groq import ChatGroq
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     )
@@ -533,33 +611,53 @@ LANGUAGE_CONFIG = {
 
 # ─── Helpers ──────────────────────────────────────────────────────────
 def _run_rag(enriched_input: str) -> str:
-    if st.session_state.rag_chain is None:
-        with st.spinner("লোড হচ্ছে... ⏳"):
-            st.session_state.rag_chain = load_rag_pipeline()
+    # st.cache_resource already handles "build once, reuse forever" — no
+    # need for a manual st.session_state.rag_chain mirror of it.
+    chain = load_rag_pipeline()
     try:
-        return st.session_state.rag_chain.invoke({
+        return chain.invoke({
             "input": enriched_input,
             "chat_history": st.session_state.chat_history,
         })
     except Exception as e:
+        logger.exception("RAG invocation failed")
         return f"❌ সমস্যা: {str(e)}"
 
 
 def _append_context(base: str) -> str:
-    if st.session_state.get("ocr_confirmed_text"):
-        base += f"\n\n[OCR Prescription]:\n{st.session_state.ocr_confirmed_text}"
-    v = st.session_state.get("vision_extracted_symptoms")
+    if st.session_state.ocr["confirmed_text"]:
+        base += f"\n\n[OCR Prescription]:\n{st.session_state.ocr['confirmed_text']}"
+    v = st.session_state.vision_extracted_symptoms
     if v and not v.startswith("ERROR"):
         base += f"\n\n[Visual Symptoms]:\n{v}"
     return base
 
 
-def _save_to_history(raw: str, enriched: str, answer: str):
+def _save_to_history(raw: str, enriched: str, answer: str) -> None:
     st.session_state.chat_history.extend([
         HumanMessage(content=enriched),
         AIMessage(content=answer),
     ])
     st.session_state.messages.append({"role": "assistant", "content": answer})
+
+
+def _process_pending_job() -> None:
+    """Consume a job queued by the triage dialog (submit or skip), if any.
+    Appends the answer to history so the normal message loop renders it —
+    no separate render call here, which avoids double-rendering it."""
+    job = st.session_state.pop("pending_chat_job", None)
+    if not job:
+        return
+    enriched = job["raw"]
+    if job["answers"]:
+        enriched += "\n\n[Patient answers]:\n"
+        for q in job["questions"]:
+            ans = job["answers"].get(str(q["id"]), "N/A")
+            enriched += f"- {q['question']}: {ans}\n"
+    enriched = _append_context(enriched)
+    with st.spinner("বিশ্লেষণ করা হচ্ছে... 🔍" if is_bangla else "Analyzing... 🔍"):
+        answer = _run_rag(enriched)
+    _save_to_history(job["raw"], enriched, answer)
 
 
 # ─── Symptom Detection ────────────────────────────────────────────────
@@ -575,7 +673,6 @@ def is_symptom_query(text: str) -> bool:
         "burning","ache","sore","hurt","suffering","feeling",
     ]
     return any(k in text.lower() for k in kws)
-
 
 
 def generate_triage_questions(symptom_text: str) -> list:
@@ -607,131 +704,80 @@ Format: {{"questions":[{{"id":1,"question":"...","options":["A","B","C","D"]}}]}
         return []
 
 
-# ─── Triage Dialog ────────────────────────────────────────────────────
-@st.dialog("🩺 লক্ষণ মূল্যায়ন" if is_bangla else "🩺 Symptoms Evaluation", width="medium")
-def triage_dialog():
-    st.caption("সব প্রশ্নের উত্তর দিন তারপর submit করুন" if is_bangla
-            else "Please answer all questions and then submit")
-    questions = st.session_state.triage_questions
-    cols = st.columns(2)
-    for i, q in enumerate(questions):
-        with cols[i % 2]:
-            with st.container(border=True):
-                st.caption(f"প্রশ্ন {i+1}" if is_bangla else f"Question {i+1}")
-                st.markdown(f"**{q['question']}**")
-                val = st.radio(q["question"], q["options"],
-                            key=f"dq_{q['id']}", index=None, label_visibility="hidden")
-                if val:
-                    st.session_state.triage_answers[str(q["id"])] = val
+# ─── Chat Panel (fragment-scoped: a new message no longer touches the sidebar) ──
+@st.fragment
+def chat_panel():
+    _process_pending_job()
 
-    answered = len(st.session_state.triage_answers)
-    total    = len(questions)
-    st.progress(answered / total if total else 0)
-    st.caption(f"✅ {answered} / {total} answered")
+    for message in st.session_state.messages[-MAX_VISIBLE_MESSAGES:]:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        if st.button("⏭️ Skip", use_container_width=True):
-            st.session_state.triage_skip      = True
-            st.session_state.triage_active    = False
-            st.session_state.triage_questions = []
-            st.rerun()
-    with c2:
-        if st.button("✅ Submit", type="primary", use_container_width=True, disabled=answered < total):
-            st.session_state.triage_submit    = True
-            st.session_state.triage_active    = False
-            st.session_state.triage_questions = []
-            st.rerun()
+    # If a triage dialog is in flight, keep showing it on every rerun of this
+    # fragment (radio-button changes, etc.) until submit/skip closes it.
+    if st.session_state.triage["active"]:
+        with st.chat_message("assistant"):
+            st.markdown("🩺 **আপনার সমস্যা আরো ভালোভাবে বুঝতে কিছু প্রশ্ন করছি:**"
+                        if is_bangla else "🩺 **To better understand your condition, please answer:**")
+        triage_dialog()
+        return
 
-
-# ─── Triage UI ────────────────────────────────────────────────────────
-if st.session_state.triage_active and st.session_state.triage_questions:
-    with st.chat_message("assistant"):
-        st.markdown("🩺 **আপনার সমস্যা আরো ভালোভাবে বুঝতে কিছু প্রশ্ন করছি:**"
-                    if is_bangla else "🩺 **To better understand your condition, please answer:**")
-    triage_dialog()
-
-if st.session_state.get("triage_submit") or st.session_state.get("triage_skip"):
-    submitted = st.session_state.pop("triage_submit", False)
-    st.session_state.pop("triage_skip", False)
-
-    enriched = st.session_state.triage_original_input
-    if submitted and st.session_state.triage_answers:
-        enriched += "\n\n[Patient answers]:\n"
-        # FIX 1: triage_questions_backup is now properly set, so this loop actually runs
-        for q in (st.session_state.get("triage_questions_backup") or []):
-            ans = st.session_state.triage_answers.get(str(q["id"]), "N/A")
-            enriched += f"- {q['question']}: {ans}\n"
-
-    enriched = _append_context(enriched)
-    original = st.session_state.triage_original_input
-
-    st.session_state.triage_answers          = {}
-    st.session_state.triage_original_input   = ""
-    st.session_state.triage_questions_backup = []
-
-    with st.chat_message("assistant"):
-        with st.spinner("বিশ্লেষণ করা হচ্ছে... 🔍" if is_bangla else "Analyzing... 🔍"):
-            answer = _run_rag(enriched)
-        st.markdown(answer)
-    _save_to_history(original, enriched, answer)
-    st.rerun()
-
-else:
-    # ─── Normal Chat Input ────────────────────────────────────────────
     placeholder = (
         "আপনার লক্ষণ বা সমস্যার কথা লিখুন অথবা মাইক্রোফোন ব্যবহার করুন..."
         if is_bangla else
         "Type your symptoms or question, or use the microphone..."
     )
     prompt = st.chat_input(placeholder, accept_audio=True, key="main_chat_input")
+    if not prompt:
+        return
 
-    if prompt:
-        user_input = ""
-        lang_cfg   = LANGUAGE_CONFIG[st.session_state.ui_language]
+    user_input = ""
+    lang_cfg = LANGUAGE_CONFIG[st.session_state.ui_language]
 
-        if prompt.audio:
-            with st.spinner(lang_cfg["spinner_msg"]):
-                try:
-                    prompt.audio.name = "recording.wav"
-                    transcription = groq_client.audio.transcriptions.create(
-                        file=prompt.audio,
-                        model="whisper-large-v3-turbo",
-                        language=lang_cfg["whisper_lang"],
-                        prompt=lang_cfg["voice_prompt"],
-                    )
-                    user_input = transcription.text
-                except Exception as e:
-                    st.error(f"{lang_cfg['error_msg']}: {e}")
-        elif prompt.text:
-            user_input = prompt.text
+    if prompt.audio:
+        with st.spinner(lang_cfg["spinner_msg"]):
+            try:
+                prompt.audio.name = "recording.wav"
+                transcription = groq_client.audio.transcriptions.create(
+                    file=prompt.audio,
+                    model="whisper-large-v3-turbo",
+                    language=lang_cfg["whisper_lang"],
+                    prompt=lang_cfg["voice_prompt"],
+                )
+                user_input = transcription.text
+            except Exception as e:
+                st.error(f"{lang_cfg['error_msg']}: {e}")
+    elif prompt.text:
+        user_input = prompt.text
 
-        if user_input:
-            with st.chat_message("user"):
-                st.markdown(user_input)
-            combined = _append_context(user_input)
+    if not user_input:
+        return
 
-            if is_symptom_query(user_input):
-                with st.spinner("🩺 লক্ষণ বিশ্লেষণ করা হচ্ছে..." if is_bangla
-                                else "🩺 Analyzing symptoms..."):
-                    questions = generate_triage_questions(user_input)
-                if questions:
-                    st.session_state.triage_active           = True
-                    st.session_state.triage_questions        = questions
-                    st.session_state.triage_questions_backup = questions   # FIX 1: save backup
-                    st.session_state.triage_original_input   = user_input
-                    st.session_state.triage_answers          = {}
-                    st.session_state.messages.append({"role": "user", "content": user_input})
-                    st.rerun()
-                else:
-                    with st.chat_message("assistant"):
-                        with st.spinner("তথ্য খোঁজা হচ্ছে..." if is_bangla else "Searching..."):
-                            answer = _run_rag(combined)
-                        st.markdown(answer)
-                    _save_to_history(user_input, combined, answer)
-            else:
-                with st.chat_message("assistant"):
-                    with st.spinner("তথ্য খোঁজা হচ্ছে..." if is_bangla else "Searching..."):
-                        answer = _run_rag(combined)
-                    st.markdown(answer)
-                _save_to_history(user_input, combined, answer)
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    combined = _append_context(user_input)
+
+    if is_symptom_query(user_input):
+        with st.spinner("🩺 লক্ষণ বিশ্লেষণ করা হচ্ছে..." if is_bangla else "🩺 Analyzing symptoms..."):
+            questions = generate_triage_questions(user_input)
+        if questions:
+            st.session_state.triage = {
+                "active": True,
+                "questions": questions,
+                "original_input": user_input,
+                "answers": {},
+            }
+            st.rerun(scope="fragment")  # rerun just this fragment to show the dialog
+            return
+        # else: fall through to a normal RAG answer below
+
+    with st.chat_message("assistant"):
+        with st.spinner("তথ্য খোঁজা হচ্ছে..." if is_bangla else "Searching..."):
+            answer = _run_rag(combined)
+        st.markdown(answer)
+    _save_to_history(user_input, combined, answer)
+
+
+chat_panel()

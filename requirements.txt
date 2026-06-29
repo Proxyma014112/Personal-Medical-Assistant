@@ -13,3 +13,4 @@ sentence-transformers
 huggingface-hub
 torch
 dotenv
+torchvision
