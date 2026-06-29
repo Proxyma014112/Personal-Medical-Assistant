@@ -109,9 +109,6 @@ for key, val in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-if "app_initialized" not in st.session_state:
-    st.session_state.app_initialized = True
-    st.rerun()
 
 is_bangla = st.session_state.ui_language == "বাংলা"
 
@@ -224,11 +221,12 @@ def dialog_ocr():
             type=["jpg", "jpeg", "png"], key="ocr_uploader_dialog"
         )
         if uploaded:
-            st.session_state.ocr_image_bytes = uploaded.read()
+            st.session_state.ocr_image_bytes = uploaded.getvalue()
             st.session_state.ocr_image_name  = uploaded.name
             st.session_state.ocr_extracted_text = None
             st.session_state.ocr_confirmed_text = None
             st.session_state.ocr_edited_text    = None
+            st.rerun()
         else:
             return
 
@@ -377,33 +375,35 @@ def dialog_emergency():
 # ─── SIDEBAR (wrapped in fragment for instant dialog opening) ──────────
 # FIX 3: @st.fragment means clicking a sidebar button only reruns this
 # block, not the entire page (chat history, RAG pipeline, etc.)
-@st.fragment
-def sidebar_and_dialogs():
+# ─── SIDEBAR ──────────────────────────────────────────────────────────
+with st.sidebar:
     st.markdown("## 👩🏻‍⚕️ MediAssist AI")
     st.caption("আপনার ব্যক্তিগত স্বাস্থ্য সহকারী" if is_bangla else "Your personal health assistant")
     st.markdown("---")
 
     st.markdown("**🛠️ টুলস**" if is_bangla else "**🛠️ Tools**")
+    
+    # Launching dialogs immediately on click prevents fragment delays
     if st.button("⚙️ সেটিংস" if is_bangla else "⚙️ Settings", use_container_width=True):
-        st.session_state.open_settings = True
-    if st.button("📊 বিএমআই ও স্বাস্থ্য ড্যাশবোর্ড" if is_bangla else "📊 BMI & Health Dashboard",
-                        use_container_width=True):
-        st.session_state.open_bmi = True
-    if st.button("👁️ ভিজ্যুয়াল লক্ষণ পরীক্ষা" if is_bangla else "👁️ Visual Symptom Checker",
-                        use_container_width=True):
-        st.session_state.open_vision = True
+        dialog_settings()
+        
+    if st.button("📊 বিএমআই ও স্বাস্থ্য ড্যাশবোর্ড" if is_bangla else "📊 BMI & Health Dashboard", use_container_width=True):
+        dialog_bmi()
+        
+    if st.button("👁️ ভিজ্যুয়াল লক্ষণ পরীক্ষা" if is_bangla else "👁️ Visual Symptom Checker", use_container_width=True):
+        dialog_vision()
+        
     if st.button("📄 প্রেসক্রিপশন OCR" if is_bangla else "📄 Prescription OCR", use_container_width=True):
-        st.session_state.open_ocr = True
+        dialog_ocr()
+        
     if st.button("🏥 হাসপাতাল ফাইন্ডার" if is_bangla else "🏥 Hospital Finder", use_container_width=True):
-        st.session_state.open_hospital = True
+        dialog_hospital()
 
     st.markdown("---")
-    if st.button("🚨 জরুরি হেল্পলাইন" if is_bangla else "🚨 Emergency Helplines",
-                        use_container_width=True, type="primary"):
-        st.session_state.open_emergency = True
+    if st.button("🚨 জরুরি হেল্পলাইন" if is_bangla else "🚨 Emergency Helplines", use_container_width=True, type="primary"):
+        dialog_emergency()
 
-    st.markdown("🆘 **জরুরি অবস্থায় `999` ডায়াল করুন**" if is_bangla
-                         else "🆘 **In an emergency, dial `999`**")
+    st.markdown("🆘 **জরুরি অবস্থায় `999` ডায়াল করুন**" if is_bangla else "🆘 **In an emergency, dial `999`**")
 
     # ─── Open dialogs ─────────────────────────────────────────────────
     if st.session_state.open_settings:
@@ -430,8 +430,7 @@ def sidebar_and_dialogs():
         st.session_state.open_emergency = False
         dialog_emergency()
 
-with st.sidebar:
-    sidebar_and_dialogs()
+
 
 
 # ─── Main Area ────────────────────────────────────────────────────────
