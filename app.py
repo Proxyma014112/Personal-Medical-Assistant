@@ -705,7 +705,6 @@ Format: {{"questions":[{{"id":1,"question":"...","options":["A","B","C","D"]}}]}
 
 
 # ─── Chat Panel (fragment-scoped: a new message no longer touches the sidebar) ──
-@st.fragment
 def chat_panel():
     _process_pending_job()
 
@@ -727,7 +726,8 @@ def chat_panel():
         if is_bangla else
         "Type your symptoms or question, or use the microphone..."
     )
-    prompt = st.chat_input(placeholder, accept_audio=True, key="main_chat_input")
+    with st.bottom:
+        prompt = st.chat_input(placeholder, accept_audio=True, key="main_chat_input")
     if not prompt:
         return
 
