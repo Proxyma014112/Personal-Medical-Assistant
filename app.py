@@ -491,13 +491,13 @@ def load_rag_pipeline():
 
         "### CORE RULES ###\n"
         "- ONLY use information from the provided context.\n"
-        "- If context lacks info, say so and ask for more information.\n"
+        "- If context lacks infoa and you are unsure, then tell him to seek help from doctor.\n"
         "- NEVER invent medical information, drug names, or dosages.\n"
         "- NEVER provide a specific diagnosis.\n\n"
         "- If you do not know anything for the context then no need to invent any info from llm "
 
         "### FORMATTING ###\n"
-        "-Use Markdown for the output.\n\n"
+        "-Use Markdown for the output. But the fontsize should not be different.\n\n"
 
         "### EMERGENCY ###\n"
         "- Chest pain + sweating / breathing difficulty / severe bleeding / unconsciousness / stroke "
