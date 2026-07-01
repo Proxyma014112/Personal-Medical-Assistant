@@ -4,7 +4,7 @@
 .env.*
 
 # ─── Vector Database (auto-generated, large files) ───────────────────
-chroma_db/
+# chroma_db/
 
 # ─── Medical Books (PDFs - may be copyrighted) ───────────────────────
 medical_books/*.pdf
